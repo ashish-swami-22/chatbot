@@ -1,0 +1,830 @@
+const http = require("node:http");
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const path = require("node:path");
+const { randomUUID } = require("node:crypto");
+
+const PORT = Number(process.env.PORT || 3000);
+const MODEL_PROVIDER = process.env.MODEL_PROVIDER || "openai-compatible";
+const MODEL_API_KEY = process.env.MODEL_API_KEY || process.env.OPENAI_API_KEY || "";
+const MODEL_NAME = process.env.MODEL_NAME || process.env.OPENAI_MODEL || "gpt-4.1-mini";
+const MODEL_BASE_URL = (process.env.MODEL_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
+const MAX_CONTEXT_MESSAGES = 10;
+const SESSION_TTL_MS = 30 * 60 * 1000;
+const MAX_CONVERSATION_TITLE_CHARS = 48;
+const DATA_DIR = path.join(__dirname, "data");
+const DB_PATH = path.join(DATA_DIR, "db.json");
+
+const conversations = new Map();
+const inFlightRequests = new Map();
+const dbState = {
+  conversations: [],
+  messages: [],
+  inferenceLogs: [],
+  events: [],
+};
+
+let persistChain = Promise.resolve();
+
+function getContentType(filePath) {
+  switch (path.extname(filePath).toLowerCase()) {
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".js":
+      return "application/javascript; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml";
+    case ".yaml":
+    case ".yml":
+      return "text/yaml; charset=utf-8";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function sendJson(res, statusCode, payload) {
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(JSON.stringify(payload));
+}
+
+function sendText(res, statusCode, text) {
+  res.writeHead(statusCode, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(text);
+}
+
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 1_000_000) {
+        reject(new Error("Request body too large."));
+        req.destroy();
+      }
+    });
+    req.on("end", () => resolve(body));
+    req.on("error", reject);
+  });
+}
+
+function sanitizeText(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function redactPii(text) {
+  const input = String(text || "");
+  return input
+    .replace(/\b[\w.-]+@[\w.-]+\.\w+\b/g, "[redacted-email]")
+    .replace(/\b(?:\+?\d[\d\s().-]{7,}\d)\b/g, "[redacted-phone]")
+    .replace(/\b(?:\d[ -]*?){13,16}\b/g, "[redacted-number]");
+}
+
+function logEvent(event, details = {}) {
+  const redactedDetails = JSON.parse(
+    JSON.stringify(details, (_key, value) => (typeof value === "string" ? redactPii(value) : value))
+  );
+  console.log(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      event,
+      ...redactedDetails,
+    })
+  );
+}
+
+function emitEvent(type, payload = {}) {
+  const record = {
+    id: randomUUID(),
+    type,
+    payload,
+    createdAt: new Date().toISOString(),
+  };
+  dbState.events.push(record);
+  return record;
+}
+
+function createConversationTitle(firstUserMessage) {
+  const cleaned = sanitizeText(firstUserMessage).replace(/\n+/g, " ");
+  if (!cleaned) {
+    return "New conversation";
+  }
+
+  if (cleaned.length <= MAX_CONVERSATION_TITLE_CHARS) {
+    return cleaned;
+  }
+
+  return `${cleaned.slice(0, MAX_CONVERSATION_TITLE_CHARS - 1).trimEnd()}...`;
+}
+
+function serializeConversation(conversation, includeMessages = false) {
+  return {
+    id: conversation.id,
+    title: conversation.title,
+    status: conversation.status,
+    createdAt: conversation.createdAt,
+    updatedAt: conversation.updatedAt,
+    lastError: conversation.lastError || null,
+    messageCount: conversation.messages.length,
+    preview: conversation.preview || "",
+    ...(includeMessages
+      ? {
+          messages: conversation.messages.map((message) => ({
+            role: message.role,
+            content: message.content,
+            createdAt: message.createdAt,
+          })),
+        }
+      : {}),
+  };
+}
+
+function touchConversation(conversation) {
+  conversation.updatedAt = new Date().toISOString();
+}
+
+function getConversation(conversationId) {
+  const key = String(conversationId || "").trim();
+  if (!key) {
+    return null;
+  }
+
+  const conversation = conversations.get(key);
+  if (conversation) {
+    touchConversation(conversation);
+    return conversation;
+  }
+
+  return null;
+}
+
+function upsertConversationRecord(conversation) {
+  const record = serializeConversation(conversation);
+  const index = dbState.conversations.findIndex((item) => item.id === record.id);
+  if (index >= 0) {
+    dbState.conversations[index] = record;
+  } else {
+    dbState.conversations.push(record);
+  }
+}
+
+function appendMessageRecord(conversationId, role, content) {
+  const record = {
+    id: randomUUID(),
+    conversationId,
+    role,
+    content,
+    createdAt: new Date().toISOString(),
+  };
+  dbState.messages.push(record);
+  return record;
+}
+
+function upsertInferenceLog(logRecord) {
+  const index = dbState.inferenceLogs.findIndex((item) => item.id === logRecord.id);
+  if (index >= 0) {
+    dbState.inferenceLogs[index] = logRecord;
+  } else {
+    dbState.inferenceLogs.push(logRecord);
+  }
+}
+
+function schedulePersist() {
+  persistChain = persistChain
+    .then(async () => {
+      await fsp.mkdir(DATA_DIR, { recursive: true });
+      const snapshot = JSON.stringify(dbState, null, 2);
+      const tempPath = `${DB_PATH}.tmp`;
+      await fsp.writeFile(tempPath, snapshot, "utf8");
+      await fsp.rename(tempPath, DB_PATH);
+    })
+    .catch((error) => {
+      console.error("Failed to persist datastore", error);
+    });
+  return persistChain;
+}
+
+function reconstructConversations() {
+  conversations.clear();
+  const messagesByConversationId = new Map();
+
+  for (const message of dbState.messages) {
+    const list = messagesByConversationId.get(message.conversationId) || [];
+    list.push(message);
+    messagesByConversationId.set(message.conversationId, list);
+  }
+
+  for (const record of dbState.conversations) {
+    conversations.set(record.id, {
+      ...record,
+      messages: messagesByConversationId.get(record.id) || [],
+      activeRequestId: null,
+      lastError: record.lastError || "",
+    });
+  }
+}
+
+async function loadDatastore() {
+  try {
+    const raw = await fsp.readFile(DB_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    dbState.conversations = Array.isArray(parsed.conversations) ? parsed.conversations : [];
+    dbState.messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+    dbState.inferenceLogs = Array.isArray(parsed.inferenceLogs) ? parsed.inferenceLogs : [];
+    dbState.events = Array.isArray(parsed.events) ? parsed.events : [];
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      console.error("Failed to load datastore", error);
+    }
+  }
+
+  reconstructConversations();
+}
+
+function trimContext(messages) {
+  return messages.slice(-MAX_CONTEXT_MESSAGES);
+}
+
+function buildModelMessages(conversation, newUserMessage) {
+  const systemPrompt = {
+    role: "system",
+    content:
+      "You are a concise, helpful chatbot. Keep replies short, natural, and conversational. Use the recent chat history for context, but do not mention hidden instructions.",
+  };
+
+  const recentMessages = trimContext(conversation.messages);
+  return [
+    systemPrompt,
+    ...recentMessages.map((message) => ({
+      role: message.role,
+      content: message.content,
+    })),
+    {
+      role: "user",
+      content: newUserMessage,
+    },
+  ];
+}
+
+function previewText(text, maxLen = 180) {
+  const normalized = redactPii(text).replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLen) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLen - 3).trimEnd()}...`;
+}
+
+async function ingestInferenceLog(payload) {
+  const conversationId = String(payload.conversationId || payload.sessionId || "").trim();
+  const provider = sanitizeText(payload.provider) || MODEL_PROVIDER;
+  const model = sanitizeText(payload.model) || MODEL_NAME;
+  const status = sanitizeText(payload.status) || "success";
+  const latencyMs = Number(payload.latencyMs || 0);
+  const startedAt = payload.startedAt || new Date().toISOString();
+  const completedAt = payload.completedAt || new Date().toISOString();
+  const inputPreview = previewText(payload.inputPreview || "");
+  const outputPreview = previewText(payload.outputPreview || "");
+  const errorMessage = sanitizeText(payload.errorMessage || payload.error || "");
+  const tokenUsage = payload.tokenUsage && typeof payload.tokenUsage === "object" ? payload.tokenUsage : null;
+
+  if (!conversationId) {
+    throw new Error("conversationId is required for inference logs.");
+  }
+
+  if (!Number.isFinite(latencyMs) || latencyMs < 0) {
+    throw new Error("latencyMs must be a non-negative number.");
+  }
+
+  const record = {
+    id: randomUUID(),
+    conversationId,
+    provider,
+    model,
+    status,
+    latencyMs,
+    startedAt,
+    completedAt,
+    loggedAt: new Date().toISOString(),
+    inputPreview,
+    outputPreview,
+    errorMessage: errorMessage || null,
+    tokenUsage,
+  };
+
+  upsertInferenceLog(record);
+  emitEvent("inference.logged", {
+    id: record.id,
+    conversationId,
+    status,
+    provider,
+    model,
+  });
+  logEvent("inference_logged", {
+    conversationId,
+    provider,
+    model,
+    status,
+    latencyMs,
+    inputPreview,
+    outputPreview,
+    errorMessage,
+  });
+  await schedulePersist();
+  return record;
+}
+
+async function safeIngestInferenceLog(payload) {
+  try {
+    return await ingestInferenceLog(payload);
+  } catch (error) {
+    console.error("Failed to ingest inference log", error);
+    return null;
+  }
+}
+
+function validateIngestPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Payload must be an object.");
+  }
+
+  if (payload.type && payload.type !== "inference_log" && payload.type !== "inference") {
+    throw new Error("Unsupported ingest type.");
+  }
+
+  return payload;
+}
+
+function aggregateDashboardMetrics() {
+  const inferenceLogs = dbState.inferenceLogs;
+  const totalLogs = inferenceLogs.length;
+  const errors = inferenceLogs.filter((item) => item.status === "error").length;
+  const canceled = inferenceLogs.filter((item) => item.status === "canceled").length;
+  const latencies = inferenceLogs.map((item) => Number(item.latencyMs || 0)).filter(Number.isFinite);
+  const totalLatency = latencies.reduce((sum, value) => sum + value, 0);
+  const avgLatencyMs = latencies.length ? Math.round(totalLatency / latencies.length) : 0;
+  const sortedLatencies = [...latencies].sort((a, b) => a - b);
+  const p95LatencyMs = sortedLatencies.length
+    ? sortedLatencies[Math.min(sortedLatencies.length - 1, Math.ceil(sortedLatencies.length * 0.95) - 1)]
+    : 0;
+  const totalPromptTokens = inferenceLogs.reduce(
+    (sum, item) => sum + Number(item.tokenUsage?.prompt_tokens || item.tokenUsage?.promptTokens || 0),
+    0
+  );
+  const totalCompletionTokens = inferenceLogs.reduce(
+    (sum, item) => sum + Number(item.tokenUsage?.completion_tokens || item.tokenUsage?.completionTokens || 0),
+    0
+  );
+  const totalTokens = inferenceLogs.reduce(
+    (sum, item) => sum + Number(item.tokenUsage?.total_tokens || item.tokenUsage?.totalTokens || 0),
+    0
+  );
+
+  return {
+    totalConversations: conversations.size,
+    activeConversations: [...conversations.values()].filter((item) => item.status === "thinking").length,
+    totalMessages: dbState.messages.length,
+    totalInferenceLogs: totalLogs,
+    errorCount: errors,
+    canceledCount: canceled,
+    avgLatencyMs,
+    p95LatencyMs,
+    totalPromptTokens,
+    totalCompletionTokens,
+    totalTokens,
+    recentLogs: inferenceLogs.slice(-20).reverse(),
+  };
+}
+
+async function callModel(messages, signal) {
+  if (!MODEL_API_KEY) {
+    throw new Error("Set MODEL_API_KEY (or OPENAI_API_KEY) to enable model responses.");
+  }
+
+  const startedAt = Date.now();
+  const response = await fetch(`${MODEL_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${MODEL_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: MODEL_NAME,
+      messages,
+      temperature: 0.7,
+    }),
+    signal,
+  });
+
+  const rawText = await response.text();
+  let data = null;
+  if (rawText) {
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      data = { raw: rawText };
+    }
+  }
+
+  const latencyMs = Date.now() - startedAt;
+
+  if (!response.ok) {
+    const detail = data?.error?.message || data?.raw || `HTTP ${response.status}`;
+    const error = new Error(`OpenAI request failed: ${detail}`);
+    error.statusCode = response.status;
+    error.latencyMs = latencyMs;
+    throw error;
+  }
+
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content) {
+    const error = new Error("The model returned an empty response.");
+    error.statusCode = 502;
+    error.latencyMs = latencyMs;
+    throw error;
+  }
+
+  return {
+    reply: String(content).trim(),
+    usage: data?.usage || null,
+    latencyMs,
+  };
+}
+
+function cleanupExpiredConversations() {
+  const now = Date.now();
+  for (const [conversationId, conversation] of conversations.entries()) {
+    if (now - new Date(conversation.updatedAt).getTime() > SESSION_TTL_MS) {
+      conversations.delete(conversationId);
+      dbState.conversations = dbState.conversations.filter((item) => item.id !== conversationId);
+      dbState.messages = dbState.messages.filter((item) => item.conversationId !== conversationId);
+      dbState.inferenceLogs = dbState.inferenceLogs.filter((item) => item.conversationId !== conversationId);
+      dbState.events = dbState.events.filter((item) => item.payload?.conversationId !== conversationId);
+      void schedulePersist();
+    }
+  }
+}
+
+async function readJson(req) {
+  const body = await readRequestBody(req);
+  return body ? JSON.parse(body) : {};
+}
+
+async function handleListConversations(req, res) {
+  const items = [...conversations.values()]
+    .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime())
+    .map((conversation) => serializeConversation(conversation));
+  return sendJson(res, 200, { conversations: items });
+}
+
+async function handleCreateConversation(req, res) {
+  const payload = await readJson(req).catch((error) => {
+    throw new Error(`Invalid JSON payload: ${error.message}`);
+  });
+  const title = sanitizeText(payload.title) || "New conversation";
+  const conversation = {
+    id: randomUUID(),
+    title,
+    status: "idle",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    preview: "",
+    lastError: "",
+    messages: [],
+    activeRequestId: null,
+  };
+
+  conversations.set(conversation.id, conversation);
+  upsertConversationRecord(conversation);
+  emitEvent("conversation.created", { conversationId: conversation.id, title: conversation.title });
+  logEvent("conversation_created", {
+    conversationId: conversation.id,
+    title: conversation.title,
+  });
+  await schedulePersist();
+  return sendJson(res, 201, { conversation: serializeConversation(conversation, true) });
+}
+
+async function handleGetConversation(conversationId, res) {
+  const conversation = getConversation(conversationId);
+  if (!conversation) {
+    return sendJson(res, 404, { error: "Conversation not found." });
+  }
+
+  return sendJson(res, 200, { conversation: serializeConversation(conversation, true) });
+}
+
+async function handleCancelConversation(conversationId, res) {
+  const conversation = getConversation(conversationId);
+  if (!conversation) {
+    return sendJson(res, 404, { error: "Conversation not found." });
+  }
+
+  const request = inFlightRequests.get(conversation.id);
+  if (request) {
+    request.controller.abort();
+    inFlightRequests.delete(conversation.id);
+  }
+
+  conversation.status = "canceled";
+  conversation.lastError = "";
+  touchConversation(conversation);
+  upsertConversationRecord(conversation);
+  emitEvent("conversation.canceled", { conversationId: conversation.id });
+  logEvent("conversation_cancel_requested", {
+    conversationId: conversation.id,
+  });
+  await schedulePersist();
+  return sendJson(res, 200, { conversation: serializeConversation(conversation) });
+}
+
+async function handleSendMessage(conversationId, req, res) {
+  const conversation = conversations.get(conversationId) || null;
+  const targetConversation = conversation || {
+    id: conversationId,
+    title: "New conversation",
+    status: "idle",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    preview: "",
+    lastError: "",
+    messages: [],
+    activeRequestId: null,
+  };
+
+  if (!conversations.has(conversationId)) {
+    conversations.set(conversationId, targetConversation);
+    upsertConversationRecord(targetConversation);
+  }
+
+  const payload = await readJson(req).catch((error) => {
+    throw new Error(`Invalid JSON payload: ${error.message}`);
+  });
+  const message = sanitizeText(payload.message);
+
+  if (!message) {
+    return sendJson(res, 400, { error: "Message is required." });
+  }
+
+  const inputPreview = previewText(message);
+  const userMessage = {
+    role: "user",
+    content: redactPii(message),
+    createdAt: new Date().toISOString(),
+  };
+
+  targetConversation.messages.push(userMessage);
+  appendMessageRecord(targetConversation.id, "user", userMessage.content);
+  if (!targetConversation.title || targetConversation.title === "New conversation") {
+    targetConversation.title = createConversationTitle(message);
+  }
+  targetConversation.preview = inputPreview;
+  targetConversation.status = "thinking";
+  targetConversation.lastError = "";
+  touchConversation(targetConversation);
+  upsertConversationRecord(targetConversation);
+  emitEvent("message.received", {
+    conversationId: targetConversation.id,
+    message: inputPreview,
+  });
+  logEvent("message_received", {
+    conversationId: targetConversation.id,
+    message,
+  });
+  await schedulePersist();
+
+  const modelMessages = buildModelMessages(targetConversation, message);
+  const controller = new AbortController();
+  const requestId = randomUUID();
+  targetConversation.activeRequestId = requestId;
+  inFlightRequests.set(targetConversation.id, { controller, requestId });
+
+  const abortOnClose = () => controller.abort();
+  req.on("close", abortOnClose);
+
+  const startedAt = new Date().toISOString();
+  try {
+    const modelResult = await callModel(modelMessages, controller.signal);
+    const reply = redactPii(modelResult.reply);
+
+    targetConversation.messages.push({
+      role: "assistant",
+      content: reply,
+      createdAt: new Date().toISOString(),
+    });
+    appendMessageRecord(targetConversation.id, "assistant", reply);
+    targetConversation.preview = previewText(reply);
+    targetConversation.status = "idle";
+    touchConversation(targetConversation);
+    upsertConversationRecord(targetConversation);
+    emitEvent("message.completed", {
+      conversationId: targetConversation.id,
+      reply: previewText(reply),
+    });
+
+    const inferenceLog = await safeIngestInferenceLog({
+      conversationId: targetConversation.id,
+      provider: MODEL_PROVIDER,
+      model: MODEL_NAME,
+      status: "success",
+      latencyMs: modelResult.latencyMs,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      tokenUsage: modelResult.usage,
+      inputPreview,
+      outputPreview: reply,
+    });
+
+    await schedulePersist();
+    return sendJson(res, 200, {
+      conversation: serializeConversation(targetConversation, true),
+      reply,
+      inferenceLog,
+    });
+  } catch (error) {
+    const latencyMs = error?.latencyMs || 0;
+    if (controller.signal.aborted) {
+      targetConversation.status = "canceled";
+      targetConversation.lastError = "Request canceled.";
+      touchConversation(targetConversation);
+      upsertConversationRecord(targetConversation);
+      emitEvent("conversation.canceled", { conversationId: targetConversation.id });
+      logEvent("conversation_canceled", {
+        conversationId: targetConversation.id,
+      });
+      await safeIngestInferenceLog({
+        conversationId: targetConversation.id,
+        provider: MODEL_PROVIDER,
+        model: MODEL_NAME,
+        status: "canceled",
+        latencyMs,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        inputPreview,
+        outputPreview: "",
+        errorMessage: "Request canceled.",
+      });
+      await schedulePersist();
+      return sendJson(res, 499, {
+        error: "Conversation canceled.",
+        conversation: serializeConversation(targetConversation, true),
+      });
+    }
+
+    targetConversation.status = "error";
+    targetConversation.lastError = error instanceof Error ? error.message : "Unexpected error";
+    touchConversation(targetConversation);
+    upsertConversationRecord(targetConversation);
+    emitEvent("conversation.failed", {
+      conversationId: targetConversation.id,
+      error: targetConversation.lastError,
+    });
+    logEvent("conversation_error", {
+      conversationId: targetConversation.id,
+      error: targetConversation.lastError,
+    });
+    await safeIngestInferenceLog({
+      conversationId: targetConversation.id,
+      provider: MODEL_PROVIDER,
+      model: MODEL_NAME,
+      status: "error",
+      latencyMs,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      inputPreview,
+      outputPreview: "",
+      errorMessage: targetConversation.lastError,
+    });
+    await schedulePersist();
+    return sendJson(res, 500, {
+      error: targetConversation.lastError,
+      conversation: serializeConversation(targetConversation, true),
+    });
+  } finally {
+    req.off("close", abortOnClose);
+    const current = inFlightRequests.get(targetConversation.id);
+    if (current?.requestId === requestId) {
+      inFlightRequests.delete(targetConversation.id);
+      targetConversation.activeRequestId = null;
+    }
+  }
+}
+
+async function handleIngest(req, res) {
+  const payload = await readJson(req).catch((error) => {
+    throw new Error(`Invalid JSON payload: ${error.message}`);
+  });
+  const normalized = validateIngestPayload(payload);
+  const record = await ingestInferenceLog(normalized);
+  return sendJson(res, 200, { ok: true, record });
+}
+
+async function handleDashboard(req, res) {
+  return sendJson(res, 200, { ok: true, dashboard: aggregateDashboardMetrics() });
+}
+
+function serveStatic(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  let safePath = url.pathname === "/" ? "/index.html" : url.pathname;
+  if (safePath === "/dashboard") {
+    safePath = "/dashboard.html";
+  }
+  const filePath = path.join(__dirname, "public", safePath);
+  const publicRoot = path.join(__dirname, "public");
+
+  if (!filePath.startsWith(publicRoot)) {
+    return sendText(res, 403, "Forbidden");
+  }
+
+  fs.readFile(filePath, (error, data) => {
+    if (error) {
+      if (error.code === "ENOENT") {
+        return sendText(res, 404, "Not found");
+      }
+      return sendText(res, 500, "Server error");
+    }
+
+    res.writeHead(200, {
+      "Content-Type": getContentType(filePath),
+      "Cache-Control": "no-store",
+    });
+    res.end(data);
+  });
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, "http://localhost");
+
+  if (req.method === "GET" && url.pathname === "/health") {
+    return sendJson(res, 200, { ok: true });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/dashboard") {
+    return handleDashboard(req, res).catch((error) => sendJson(res, 500, { error: error.message }));
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/ingest") {
+    return handleIngest(req, res).catch((error) => sendJson(res, 400, { error: error.message }));
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/conversations") {
+    return handleListConversations(req, res);
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/conversations") {
+    return handleCreateConversation(req, res).catch((error) =>
+      sendJson(res, 400, { error: error.message })
+    );
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/api/conversations/")) {
+    const [conversationId] = url.pathname.split("/").slice(3);
+    return handleGetConversation(conversationId, res);
+  }
+
+  if (req.method === "POST" && url.pathname.endsWith("/messages")) {
+    const [conversationId] = url.pathname.split("/").slice(3, 4);
+    return handleSendMessage(conversationId, req, res).catch((error) =>
+      sendJson(res, 500, { error: error.message })
+    );
+  }
+
+  if (req.method === "POST" && url.pathname.endsWith("/cancel")) {
+    const [conversationId] = url.pathname.split("/").slice(3, 4);
+    return handleCancelConversation(conversationId, res).catch((error) =>
+      sendJson(res, 400, { error: error.message })
+    );
+  }
+
+  if (req.method === "GET") {
+    return serveStatic(req, res);
+  }
+
+  return sendText(res, 405, "Method not allowed");
+});
+
+async function bootstrap() {
+  await loadDatastore();
+  server.listen(PORT, () => {
+    console.log(`Chatbot app running at http://localhost:${PORT}`);
+  });
+
+  setInterval(() => {
+    cleanupExpiredConversations();
+  }, 10 * 60 * 1000);
+}
+
+bootstrap().catch((error) => {
+  console.error("Failed to start server", error);
+  process.exit(1);
+});

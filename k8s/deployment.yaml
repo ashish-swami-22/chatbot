@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chatbot-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chatbot-app
+  template:
+    metadata:
+      labels:
+        app: chatbot-app
+    spec:
+      containers:
+        - name: chatbot-app
+          image: chatbot-app:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: MODEL_PROVIDER
+              valueFrom:
+                configMapKeyRef:
+                  name: chatbot-config
+                  key: model_provider
+            - name: MODEL_BASE_URL
+              value: "https://api.openai.com/v1"
+            - name: MODEL_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: chatbot-config
+                  key: model_name
+            - name: MODEL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: chatbot-secrets
+                  key: model_api_key
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 20

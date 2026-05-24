@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Inference Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="backdrop backdrop-one"></div>
+    <div class="backdrop backdrop-two"></div>
+
+    <main class="dashboard-shell">
+      <section class="card dashboard-header">
+        <div>
+          <p class="eyebrow">LLM inference logger</p>
+          <h1>Latency, tokens, and error monitoring.</h1>
+          <p class="lede">Real-time dashboard for the lightweight ingestion pipeline.</p>
+        </div>
+        <a class="ghost-button" href="/">Back to chat</a>
+      </section>
+
+      <section class="dashboard-grid" id="metricsGrid"></section>
+
+      <section class="card dashboard-panel">
+        <header class="chat-header" style="padding-top: 0;">
+          <div>
+            <div class="section-title">Recent inference logs</div>
+            <div class="section-subtitle">Most recent calls captured by the SDK wrapper</div>
+          </div>
+        </header>
+        <div style="overflow:auto;">
+          <table class="logs-table">
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Model</th>
+                <th>Latency</th>
+                <th>Tokens</th>
+                <th>Input Preview</th>
+                <th>Output Preview</th>
+                <th>Time</th>
+              </tr>
+            </thead>
+            <tbody id="logsTable"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="/dashboard.js"></script>
+  </body>
+</html>

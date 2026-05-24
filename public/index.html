@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Chatbot Application</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="backdrop backdrop-one"></div>
+    <div class="backdrop backdrop-two"></div>
+
+    <main class="shell">
+      <aside class="sidebar">
+        <section class="card intro-card">
+          <p class="eyebrow">Foundation model chatbot</p>
+          <h1>Multi-conversation chat with short retained context.</h1>
+          <p class="lede">
+            Create, resume, and cancel conversations from a single UI. The backend keeps a short
+            context window per conversation and redacts common PII patterns before logging or
+            storing content.
+          </p>
+        <div class="status-row">
+          <span class="status-dot"></span>
+          <span id="connectionStatus">Ready</span>
+          <a class="ghost-button" href="/dashboard">Open dashboard</a>
+        </div>
+      </section>
+
+        <section class="card list-card">
+          <div class="list-header">
+            <div>
+              <div class="section-title">Conversations</div>
+              <div class="section-subtitle">Resume any saved thread</div>
+            </div>
+            <button id="newConversationButton" class="ghost-button" type="button">
+              New conversation
+            </button>
+          </div>
+
+          <div id="conversationList" class="conversation-list" aria-label="Conversation list"></div>
+        </section>
+      </aside>
+
+      <section class="chat-card card">
+        <header class="chat-header">
+          <div>
+            <div id="activeConversationTitle" class="chat-title">Conversation</div>
+            <div id="activeConversationSubtitle" class="chat-subtitle">
+              Select a thread or start a new one.
+            </div>
+          </div>
+          <div class="header-actions">
+            <button id="cancelButton" class="ghost-button" type="button">Cancel conversation</button>
+            <button id="resetButton" class="ghost-button" type="button">Clear thread</button>
+          </div>
+        </header>
+
+        <div id="messages" class="messages" aria-live="polite" aria-label="Chat messages"></div>
+
+        <form id="chatForm" class="composer">
+          <label class="sr-only" for="messageInput">Message</label>
+          <textarea
+            id="messageInput"
+            rows="1"
+            placeholder="Ask something, then keep the conversation going..."
+          ></textarea>
+          <button id="sendButton" class="send-button" type="submit">Send</button>
+        </form>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

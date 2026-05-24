@@ -1,0 +1,14 @@
+services:
+  chatbot:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      PORT: 3000
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-openai-compatible}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-https://api.openai.com/v1}
+      MODEL_NAME: ${MODEL_NAME:-gpt-4.1-mini}
+      MODEL_API_KEY: ${MODEL_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}

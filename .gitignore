@@ -1,0 +1,30 @@
+# dependencies
+node_modules/
+
+# env files
+.env
+.env.*
+!.env.example
+
+# build outputs
+.next/
+out/
+dist/
+coverage/
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# local app data
+data/db.json
+
+# Supabase local temp files
+supabase/.temp/
+supabase/.branches/
