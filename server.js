@@ -62,13 +62,35 @@ function sendText(res, statusCode, text) {
   res.end(text);
 }
 
+function createHttpError(message, statusCode = 400) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function getErrorStatusCode(error, fallbackStatusCode = 500) {
+  const statusCode = Number(error && error.statusCode);
+  if (Number.isInteger(statusCode) && statusCode >= 400 && statusCode < 600) {
+    return statusCode;
+  }
+  return fallbackStatusCode;
+}
+
+function getClientErrorMessage(error, fallbackMessage) {
+  const statusCode = getErrorStatusCode(error, 500);
+  if (statusCode < 500 && error && error.message) {
+    return error.message;
+  }
+  return fallbackMessage;
+}
+
 function readRequestBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
     req.on("data", (chunk) => {
       body += chunk;
       if (body.length > 1_000_000) {
-        reject(new Error("Request body too large."));
+        reject(createHttpError("Request body too large.", 413));
         req.destroy();
       }
     });
@@ -129,13 +151,20 @@ function createConversationTitle(firstUserMessage) {
 }
 
 function serializeConversation(conversation, includeMessages = false) {
+  const displayLastError =
+    conversation.status === "error"
+      ? "Request failed."
+      : conversation.status === "canceled"
+        ? "Request canceled."
+        : conversation.lastError || null;
+
   return {
     id: conversation.id,
     title: conversation.title,
     status: conversation.status,
     createdAt: conversation.createdAt,
     updatedAt: conversation.updatedAt,
-    lastError: conversation.lastError || null,
+    lastError: displayLastError,
     messageCount: conversation.messages.length,
     preview: conversation.preview || "",
     ...(includeMessages
@@ -344,22 +373,49 @@ async function ingestInferenceLog(payload) {
   return record;
 }
 
+async function forwardInferenceLogToEndpoint(payload) {
+  const response = await fetch(`http://127.0.0.1:${PORT}/api/ingest`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = data.error || `HTTP ${response.status}`;
+    throw createHttpError(`Ingestion endpoint failed: ${detail}`, response.status);
+  }
+
+  return data.record || null;
+}
+
 async function safeIngestInferenceLog(payload) {
   try {
-    return await ingestInferenceLog(payload);
+    return await forwardInferenceLogToEndpoint(payload);
   } catch (error) {
-    console.error("Failed to ingest inference log", error);
-    return null;
+    console.error("Failed to ingest inference log via endpoint", error);
+    try {
+      return await ingestInferenceLog(payload);
+    } catch (fallbackError) {
+      console.error("Fallback ingestion failed", fallbackError);
+      return null;
+    }
   }
 }
 
 function validateIngestPayload(payload) {
   if (!payload || typeof payload !== "object") {
-    throw new Error("Payload must be an object.");
+    throw createHttpError("Payload must be an object.", 400);
   }
 
   if (payload.type && payload.type !== "inference_log" && payload.type !== "inference") {
-    throw new Error("Unsupported ingest type.");
+    throw createHttpError("Unsupported ingest type.", 400);
+  }
+
+  if (!String(payload.conversationId || payload.sessionId || "").trim()) {
+    throw createHttpError("conversationId is required.", 400);
   }
 
   return payload;
@@ -477,7 +533,15 @@ function cleanupExpiredConversations() {
 
 async function readJson(req) {
   const body = await readRequestBody(req);
-  return body ? JSON.parse(body) : {};
+  if (!body) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw createHttpError("Invalid JSON payload.", 400);
+  }
 }
 
 async function handleListConversations(req, res) {
@@ -488,9 +552,7 @@ async function handleListConversations(req, res) {
 }
 
 async function handleCreateConversation(req, res) {
-  const payload = await readJson(req).catch((error) => {
-    throw new Error(`Invalid JSON payload: ${error.message}`);
-  });
+  const payload = await readJson(req);
   const title = sanitizeText(payload.title) || "New conversation";
   const conversation = {
     id: randomUUID(),
@@ -567,9 +629,7 @@ async function handleSendMessage(conversationId, req, res) {
     upsertConversationRecord(targetConversation);
   }
 
-  const payload = await readJson(req).catch((error) => {
-    throw new Error(`Invalid JSON payload: ${error.message}`);
-  });
+  const payload = await readJson(req);
   const message = sanitizeText(payload.message);
 
   if (!message) {
@@ -675,14 +735,14 @@ async function handleSendMessage(conversationId, req, res) {
         errorMessage: "Request canceled.",
       });
       await schedulePersist();
-      return sendJson(res, 499, {
-        error: "Conversation canceled.",
-        conversation: serializeConversation(targetConversation, true),
-      });
-    }
+    return sendJson(res, 499, {
+      error: "Conversation canceled.",
+      conversation: serializeConversation(targetConversation, true),
+    });
+  }
 
-    targetConversation.status = "error";
-    targetConversation.lastError = error instanceof Error ? error.message : "Unexpected error";
+  targetConversation.status = "error";
+  targetConversation.lastError = error instanceof Error ? error.message : "Unexpected error";
     touchConversation(targetConversation);
     upsertConversationRecord(targetConversation);
     emitEvent("conversation.failed", {
@@ -707,7 +767,7 @@ async function handleSendMessage(conversationId, req, res) {
     });
     await schedulePersist();
     return sendJson(res, 500, {
-      error: targetConversation.lastError,
+      error: "Failed to generate a reply.",
       conversation: serializeConversation(targetConversation, true),
     });
   } finally {
@@ -721,9 +781,7 @@ async function handleSendMessage(conversationId, req, res) {
 }
 
 async function handleIngest(req, res) {
-  const payload = await readJson(req).catch((error) => {
-    throw new Error(`Invalid JSON payload: ${error.message}`);
-  });
+  const payload = await readJson(req);
   const normalized = validateIngestPayload(payload);
   const record = await ingestInferenceLog(normalized);
   return sendJson(res, 200, { ok: true, record });
@@ -770,11 +828,19 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "GET" && url.pathname === "/api/dashboard") {
-    return handleDashboard(req, res).catch((error) => sendJson(res, 500, { error: error.message }));
+    return handleDashboard(req, res).catch((error) =>
+      sendJson(res, getErrorStatusCode(error, 500), {
+        error: getClientErrorMessage(error, "Failed to load dashboard."),
+      })
+    );
   }
 
   if (req.method === "POST" && url.pathname === "/api/ingest") {
-    return handleIngest(req, res).catch((error) => sendJson(res, 400, { error: error.message }));
+    return handleIngest(req, res).catch((error) =>
+      sendJson(res, getErrorStatusCode(error, 500), {
+        error: getClientErrorMessage(error, "Failed to ingest log."),
+      })
+    );
   }
 
   if (req.method === "GET" && url.pathname === "/api/conversations") {
@@ -783,7 +849,9 @@ const server = http.createServer((req, res) => {
 
   if (req.method === "POST" && url.pathname === "/api/conversations") {
     return handleCreateConversation(req, res).catch((error) =>
-      sendJson(res, 400, { error: error.message })
+      sendJson(res, getErrorStatusCode(error, 500), {
+        error: getClientErrorMessage(error, "Failed to create conversation."),
+      })
     );
   }
 
@@ -795,14 +863,18 @@ const server = http.createServer((req, res) => {
   if (req.method === "POST" && url.pathname.endsWith("/messages")) {
     const [conversationId] = url.pathname.split("/").slice(3, 4);
     return handleSendMessage(conversationId, req, res).catch((error) =>
-      sendJson(res, 500, { error: error.message })
+      sendJson(res, getErrorStatusCode(error, 500), {
+        error: getClientErrorMessage(error, "Failed to generate a reply."),
+      })
     );
   }
 
   if (req.method === "POST" && url.pathname.endsWith("/cancel")) {
     const [conversationId] = url.pathname.split("/").slice(3, 4);
     return handleCancelConversation(conversationId, res).catch((error) =>
-      sendJson(res, 400, { error: error.message })
+      sendJson(res, getErrorStatusCode(error, 500), {
+        error: getClientErrorMessage(error, "Failed to cancel conversation."),
+      })
     );
   }
 

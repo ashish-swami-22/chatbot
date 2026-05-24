@@ -1,6 +1,6 @@
 # LLM Inference Logger
 
-A lightweight chatbot plus inference logging and ingestion system.
+ChatBot is a simple web app for chatting with an AI model.
 
 The app supports:
 
@@ -70,6 +70,8 @@ docker compose up --build
 - Storage:
   - File-backed datastore in `data/db.json` for the lightweight local implementation
   - Supabase/Postgres schema included in `supabase/migrations/0001_init.sql`
+- Canonical runnable app:
+  - `server.js` + `public/`
 
 ## Schema Design Decisions
 
@@ -255,7 +257,5 @@ The UI allows:
   - Lightweight local datastore.
 - `supabase/migrations/0001_init.sql`
   - PostgreSQL schema for a Supabase-backed storage path.
-- `apps/web/`
-  - Next.js-style scaffold matching the requested folder structure.
 - `ARCHITECTURE.md`
   - Short architecture notes.

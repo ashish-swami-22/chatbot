@@ -1,7 +1,7 @@
 {
   "name": "chatbot-application",
   "version": "1.0.0",
-  "description": "Lightweight LLM chatbot with inference logging, ingestion, dashboard metrics, and a short conversation context.",
+  "description": "ChatBot",
   "type": "commonjs",
   "main": "server.js",
   "scripts": {

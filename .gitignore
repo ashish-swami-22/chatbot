@@ -23,8 +23,16 @@ pnpm-debug.log*
 Thumbs.db
 
 # local app data
-data/db.json
+data/
+
+# editor settings
+.vscode/
+.idea/
 
 # Supabase local temp files
 supabase/.temp/
 supabase/.branches/
+
+# local databases
+*.db
+*.sqlite
