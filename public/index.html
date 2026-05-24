@@ -13,28 +13,21 @@
     <main class="shell">
       <aside class="sidebar">
         <section class="card intro-card">
-          <p class="eyebrow">Foundation model chatbot</p>
-          <h1>Multi-conversation chat with short retained context.</h1>
-          <p class="lede">
-            Create, resume, and cancel conversations from a single UI. The backend keeps a short
-            context window per conversation and redacts common PII patterns before logging or
-            storing content.
-          </p>
-        <div class="status-row">
-          <span class="status-dot"></span>
-          <span id="connectionStatus">Ready</span>
-          <a class="ghost-button" href="/dashboard">Open dashboard</a>
-        </div>
-      </section>
-
-        <section class="card list-card">
           <div class="list-header">
+            <div>
+              <div class="section-title">Dashboard</div>
+              <div class="section-subtitle">View chat metrics</div>
+            </div>
+            <a class="dashboard-button" href="/dashboard">Dashboard</a>
+          </div>
+
+          <div class="list-header history-header">
             <div>
               <div class="section-title">Conversations</div>
               <div class="section-subtitle">Resume any saved thread</div>
             </div>
             <button id="newConversationButton" class="ghost-button" type="button">
-              New conversation
+              New chat
             </button>
           </div>
 

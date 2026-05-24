@@ -6,7 +6,6 @@ const resetButtonEl = document.getElementById("resetButton");
 const cancelButtonEl = document.getElementById("cancelButton");
 const newConversationButtonEl = document.getElementById("newConversationButton");
 const conversationListEl = document.getElementById("conversationList");
-const connectionStatusEl = document.getElementById("connectionStatus");
 const activeConversationTitleEl = document.getElementById("activeConversationTitle");
 const activeConversationSubtitleEl = document.getElementById("activeConversationSubtitle");
 
@@ -19,7 +18,6 @@ let currentAbortController = null;
 let currentReplyNode = null;
 
 function setStatus(text) {
-  connectionStatusEl.textContent = text;
 }
 
 function scrollToBottom() {

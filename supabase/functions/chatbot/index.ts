@@ -46,6 +46,7 @@ async function callModel(messages: ChatMessage[]) {
         error?: { message?: unknown };
         raw?: unknown;
         choices?: Array<{ message?: { content?: unknown } }>;
+        usage?: unknown;
       }
     | null = null;
   if (text) {
@@ -54,6 +55,7 @@ async function callModel(messages: ChatMessage[]) {
         error?: { message?: unknown };
         raw?: unknown;
         choices?: Array<{ message?: { content?: unknown } }>;
+        usage?: unknown;
       };
     } catch {
       data = { raw: text };
@@ -71,7 +73,10 @@ async function callModel(messages: ChatMessage[]) {
     throw new Error("Empty model response.");
   }
 
-  return String(reply).trim();
+  return {
+    reply: String(reply).trim(),
+    usage: data?.usage || null,
+  };
 }
 
 Deno.serve(async (req) => {
@@ -121,9 +126,9 @@ Deno.serve(async (req) => {
       { role: "user", content: message },
     ];
 
-    const reply = await callModel(messages);
+    const result = await callModel(messages);
 
-    return new Response(JSON.stringify({ reply }), {
+    return new Response(JSON.stringify(result), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (error) {

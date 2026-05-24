@@ -9,6 +9,8 @@ const MODEL_PROVIDER = process.env.MODEL_PROVIDER || "openai-compatible";
 const MODEL_API_KEY = process.env.MODEL_API_KEY || process.env.OPENAI_API_KEY || "";
 const MODEL_NAME = process.env.MODEL_NAME || process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const MODEL_BASE_URL = (process.env.MODEL_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
+const SUPABASE_EDGE_FUNCTION_URL = SUPABASE_URL ? `${SUPABASE_URL}/functions/v1/chatbot` : "";
 const MAX_CONTEXT_MESSAGES = 10;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MAX_CONVERSATION_TITLE_CHARS = 48;
@@ -462,7 +464,7 @@ function aggregateDashboardMetrics() {
   };
 }
 
-async function callModel(messages, signal) {
+async function callOpenAiCompatibleModel(messages, signal) {
   if (!MODEL_API_KEY) {
     throw new Error("Set MODEL_API_KEY (or OPENAI_API_KEY) to enable model responses.");
   }
@@ -514,6 +516,88 @@ async function callModel(messages, signal) {
     reply: String(content).trim(),
     usage: data?.usage || null,
     latencyMs,
+  };
+}
+
+async function callSupabaseEdgeFunction(messages, signal) {
+  if (!SUPABASE_EDGE_FUNCTION_URL) {
+    throw new Error("Set SUPABASE_URL to enable the Supabase Edge Function path.");
+  }
+
+  const userMessage = messages[messages.length - 1]?.content || "";
+  const context = messages
+    .slice(1, -1)
+    .filter((item) => item && typeof item === "object")
+    .map((item) => ({
+      role: item.role,
+      content: item.content,
+    }));
+
+  const startedAt = Date.now();
+  const response = await fetch(SUPABASE_EDGE_FUNCTION_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      message: userMessage,
+      context,
+    }),
+    signal,
+  });
+
+  const rawText = await response.text();
+  let data = null;
+  if (rawText) {
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      data = { raw: rawText };
+    }
+  }
+
+  const latencyMs = Date.now() - startedAt;
+
+  if (!response.ok) {
+    const detail = data?.error || data?.raw || `HTTP ${response.status}`;
+    const error = new Error(`Supabase edge function failed: ${detail}`);
+    error.statusCode = response.status;
+    error.latencyMs = latencyMs;
+    throw error;
+  }
+
+  const reply = data?.reply;
+  if (!reply) {
+    const error = new Error("The edge function returned an empty response.");
+    error.statusCode = 502;
+    error.latencyMs = latencyMs;
+    throw error;
+  }
+
+  return {
+    reply: String(reply).trim(),
+    usage: data?.usage || null,
+    latencyMs,
+  };
+}
+
+async function callModel(messages, signal) {
+  if (SUPABASE_EDGE_FUNCTION_URL) {
+    try {
+      const edgeResult = await callSupabaseEdgeFunction(messages, signal);
+      return {
+        ...edgeResult,
+        provider: "supabase-edge",
+      };
+    } catch (edgeError) {
+      console.error("Supabase edge function call failed, falling back to direct model call", edgeError);
+    }
+  }
+
+  const fallbackResult = await callOpenAiCompatibleModel(messages, signal);
+  return {
+    ...fallbackResult,
+    provider: MODEL_PROVIDER,
   };
 }
 
@@ -668,6 +752,7 @@ async function handleSendMessage(conversationId, req, res) {
   const requestId = randomUUID();
   targetConversation.activeRequestId = requestId;
   inFlightRequests.set(targetConversation.id, { controller, requestId });
+  let inferenceProvider = SUPABASE_EDGE_FUNCTION_URL ? "supabase-edge" : MODEL_PROVIDER;
 
   const abortOnClose = () => controller.abort();
   req.on("close", abortOnClose);
@@ -675,6 +760,7 @@ async function handleSendMessage(conversationId, req, res) {
   const startedAt = new Date().toISOString();
   try {
     const modelResult = await callModel(modelMessages, controller.signal);
+    inferenceProvider = modelResult.provider || inferenceProvider;
     const reply = redactPii(modelResult.reply);
 
     targetConversation.messages.push({
@@ -694,7 +780,7 @@ async function handleSendMessage(conversationId, req, res) {
 
     const inferenceLog = await safeIngestInferenceLog({
       conversationId: targetConversation.id,
-      provider: MODEL_PROVIDER,
+      provider: inferenceProvider,
       model: MODEL_NAME,
       status: "success",
       latencyMs: modelResult.latencyMs,
@@ -724,7 +810,7 @@ async function handleSendMessage(conversationId, req, res) {
       });
       await safeIngestInferenceLog({
         conversationId: targetConversation.id,
-        provider: MODEL_PROVIDER,
+        provider: inferenceProvider,
         model: MODEL_NAME,
         status: "canceled",
         latencyMs,
@@ -755,7 +841,7 @@ async function handleSendMessage(conversationId, req, res) {
     });
     await safeIngestInferenceLog({
       conversationId: targetConversation.id,
-      provider: MODEL_PROVIDER,
+      provider: inferenceProvider,
       model: MODEL_NAME,
       status: "error",
       latencyMs,

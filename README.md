@@ -235,7 +235,7 @@ The UI allows:
 - `PORT`
   - Optional. Defaults to `3000`.
 - `SUPABASE_URL`
-  - Required for a Supabase-backed deployment.
+  - Required for a Supabase-backed deployment. When set, the server uses the Supabase Edge Function for chat generation.
 - `SUPABASE_SERVICE_ROLE_KEY`
   - Required for server-side database access and ingestion writes.
 
