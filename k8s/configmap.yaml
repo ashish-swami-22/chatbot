@@ -3,5 +3,5 @@ kind: ConfigMap
 metadata:
   name: chatbot-config
 data:
-  model_provider: openai-compatible
-  model_name: gpt-4.1-mini
+  gemini_base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+  gemini_model: gemini-2.5-flash

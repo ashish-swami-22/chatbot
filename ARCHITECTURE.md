@@ -26,7 +26,7 @@
 ## Scaling Considerations
 
 - The default datastore is a local JSON file.
-- For horizontal scaling, move persistence to PostgreSQL or Supabase if needed.
+- For horizontal scaling, move persistence to PostgreSQL or another external store if needed.
 - Dashboard aggregates are computed on read for simplicity.
 - If volume grows, precompute counters or push logs to a queue.
 

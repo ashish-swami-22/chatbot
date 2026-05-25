@@ -7,8 +7,6 @@ services:
       - ./data:/app/data
     environment:
       PORT: 3000
-      MODEL_PROVIDER: ${MODEL_PROVIDER:-openai-compatible}
-      MODEL_BASE_URL: ${MODEL_BASE_URL:-https://api.openai.com/v1}
-      MODEL_NAME: ${MODEL_NAME:-gpt-4.1-mini}
-      MODEL_API_KEY: ${MODEL_API_KEY}
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}

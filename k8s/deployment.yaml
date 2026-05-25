@@ -20,23 +20,21 @@ spec:
           env:
             - name: PORT
               value: "3000"
-            - name: MODEL_PROVIDER
+            - name: GEMINI_BASE_URL
               valueFrom:
                 configMapKeyRef:
                   name: chatbot-config
-                  key: model_provider
-            - name: MODEL_BASE_URL
-              value: "https://api.openai.com/v1"
-            - name: MODEL_NAME
+                  key: gemini_base_url
+            - name: GEMINI_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: chatbot-config
-                  key: model_name
-            - name: MODEL_API_KEY
+                  key: gemini_model
+            - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: chatbot-secrets
-                  key: model_api_key
+                  key: gemini_api_key
           readinessProbe:
             httpGet:
               path: /health

@@ -42,9 +42,9 @@ function loadEnvFile() {
 loadEnvFile();
 
 const PORT = Number(process.env.PORT || 3000);
-const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
-const SUPABASE_EDGE_FUNCTION_URL = SUPABASE_URL ? `${SUPABASE_URL}/functions/v1/chatbot` : "";
-const DEFAULT_MODEL_NAME = "gemini-2.5-flash";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const DEFAULT_MODEL_NAME = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_BASE_URL = (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta/openai/").replace(/\/+$/, "");
 const MAX_CONTEXT_MESSAGES = 10;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MAX_CONVERSATION_TITLE_CHARS = 48;
@@ -237,7 +237,7 @@ function getConversation(conversationId) {
 function upsertConversationRecord(conversation) {
   const record = {
     ...serializeConversation(conversation),
-    provider: conversation.provider || "gemini-edge",
+    provider: conversation.provider || "gemini",
     model: conversation.model || DEFAULT_MODEL_NAME,
     lastError: conversation.lastError || "",
   };
@@ -385,7 +385,7 @@ function previewText(text, maxLen = 180) {
 
 async function ingestInferenceLog(payload) {
   const conversationId = String(payload.conversationId || payload.sessionId || "").trim();
-  const provider = sanitizeText(payload.provider) || "gemini-edge";
+  const provider = sanitizeText(payload.provider) || "gemini";
   const model = sanitizeText(payload.model) || DEFAULT_MODEL_NAME;
   const status = sanitizeText(payload.status) || "success";
   const latencyMs = Number(payload.latencyMs || 0);
@@ -531,29 +531,22 @@ function aggregateDashboardMetrics() {
   };
 }
 
-async function callSupabaseEdgeFunction(messages, signal) {
-  if (!SUPABASE_EDGE_FUNCTION_URL) {
-    throw createHttpError("Set SUPABASE_URL to enable the Supabase Edge Function path.", 500);
+async function callModel(messages, signal) {
+  if (!GEMINI_API_KEY) {
+    throw new Error("Set GEMINI_API_KEY to enable model responses.");
   }
 
-  const userMessage = messages[messages.length - 1]?.content || "";
-  const context = messages
-    .slice(1, -1)
-    .filter((item) => item && typeof item === "object")
-    .map((item) => ({
-      role: item.role,
-      content: item.content,
-    }));
-
   const startedAt = Date.now();
-  const response = await fetch(SUPABASE_EDGE_FUNCTION_URL, {
+  const response = await fetch(`${GEMINI_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
+      Authorization: `Bearer ${GEMINI_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      message: userMessage,
-      context,
+      model: DEFAULT_MODEL_NAME,
+      messages,
+      temperature: 0.7,
     }),
     signal,
   });
@@ -571,16 +564,16 @@ async function callSupabaseEdgeFunction(messages, signal) {
   const latencyMs = Date.now() - startedAt;
 
   if (!response.ok) {
-    const detail = data?.error || data?.raw || `HTTP ${response.status}`;
-    const error = new Error(`Supabase edge function failed: ${detail}`);
+    const detail = data?.error?.message || data?.error || data?.raw || rawText || `HTTP ${response.status}`;
+    const error = new Error(`Gemini request failed: ${detail}`);
     error.statusCode = response.status;
     error.latencyMs = latencyMs;
     throw error;
   }
 
-  const reply = data?.reply;
+  const reply = data?.choices?.[0]?.message?.content;
   if (!reply) {
-    const error = new Error("The edge function returned an empty response.");
+    const error = new Error("The model returned an empty response.");
     error.statusCode = 502;
     error.latencyMs = latencyMs;
     throw error;
@@ -591,14 +584,6 @@ async function callSupabaseEdgeFunction(messages, signal) {
     usage: data?.usage || null,
     model: sanitizeText(data?.model) || DEFAULT_MODEL_NAME,
     latencyMs,
-  };
-}
-
-async function callModel(messages, signal) {
-  const edgeResult = await callSupabaseEdgeFunction(messages, signal);
-  return {
-    ...edgeResult,
-    provider: "gemini-edge",
   };
 }
 
@@ -643,7 +628,7 @@ async function handleCreateConversation(req, res) {
     id: randomUUID(),
     title,
     status: "idle",
-    provider: "gemini-edge",
+    provider: "gemini",
     model: DEFAULT_MODEL_NAME,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -703,7 +688,7 @@ async function handleSendMessage(conversationId, req, res) {
     id: conversationId,
     title: "New chat",
     status: "idle",
-    provider: "gemini-edge",
+    provider: "gemini",
     model: DEFAULT_MODEL_NAME,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -741,7 +726,7 @@ async function handleSendMessage(conversationId, req, res) {
   targetConversation.preview = inputPreview;
   targetConversation.status = "thinking";
   targetConversation.lastError = "";
-  targetConversation.provider = "gemini-edge";
+  targetConversation.provider = "gemini";
   targetConversation.model = DEFAULT_MODEL_NAME;
   touchConversation(targetConversation);
   upsertConversationRecord(targetConversation);
@@ -760,7 +745,7 @@ async function handleSendMessage(conversationId, req, res) {
   const requestId = randomUUID();
   targetConversation.activeRequestId = requestId;
   inFlightRequests.set(targetConversation.id, { controller, requestId });
-  const inferenceProvider = "gemini-edge";
+  const inferenceProvider = "gemini";
   let modelName = DEFAULT_MODEL_NAME;
 
   const abortOnClose = () => controller.abort();
@@ -982,14 +967,9 @@ const server = http.createServer((req, res) => {
 });
 
 async function bootstrap() {
-  if (!SUPABASE_URL) {
-    throw new Error("Set SUPABASE_URL to use the Supabase Edge Function path.");
-  }
-
   await loadDatastore();
   server.listen(PORT, () => {
     console.log(`ChatBot running at http://localhost:${PORT}`);
-    console.log(`Using Supabase Edge Function: ${SUPABASE_EDGE_FUNCTION_URL}`);
   });
 
   setInterval(() => {
