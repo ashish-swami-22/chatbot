@@ -6,7 +6,7 @@
 2. The server stores the user message and builds a short context window.
 3. The model wrapper measures latency and captures token usage, previews, and errors.
 4. The wrapper sends a normalized inference record to the ingestion endpoint.
-5. The ingestion endpoint validates the payload and stores it in the datastore.
+5. The ingestion endpoint validates the payload and stores it in the local file-backed datastore.
 6. The dashboard reads aggregated metrics from the stored logs.
 
 ## Logging Strategy
@@ -25,8 +25,8 @@
 
 ## Scaling Considerations
 
-- The default datastore is file-backed and suitable for a lightweight demo.
-- For horizontal scaling, move the same schema to PostgreSQL or Supabase.
+- The default datastore is a local JSON file.
+- For horizontal scaling, move persistence to PostgreSQL or Supabase if needed.
 - Dashboard aggregates are computed on read for simplicity.
 - If volume grows, precompute counters or push logs to a queue.
 

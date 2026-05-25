@@ -17,9 +17,6 @@ let activeConversationId = localStorage.getItem(STORAGE_KEY) || "";
 let currentAbortController = null;
 let currentReplyNode = null;
 
-function setStatus(text) {
-}
-
 function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -117,7 +114,6 @@ function setActiveConversation(conversation, { preserveInput = false } = {}) {
   }`;
   renderConversationMessages(conversation);
   renderConversationList();
-  setStatus(conversation.status === "thinking" ? "Thinking..." : "Ready");
 
   if (!preserveInput) {
     inputEl.value = "";
@@ -191,7 +187,7 @@ async function loadConversation(conversationId, { fromRefresh = false } = {}) {
 async function createConversation() {
   const data = await fetchJson("/api/conversations", {
     method: "POST",
-    body: JSON.stringify({ title: "New conversation" }),
+    body: JSON.stringify({ title: "New chat" }),
   });
 
   const conversation = data.conversation;
@@ -209,7 +205,6 @@ function setBusy(isBusy) {
   conversationListEl.querySelectorAll("button").forEach((button) => {
     button.disabled = isBusy;
   });
-  setStatus(isBusy ? "Thinking..." : "Ready");
 }
 
 function autosize() {
@@ -260,13 +255,11 @@ async function submitMessage(message) {
       updatedConversation.status || "idle"
     }`;
     renderConversationList();
-    setStatus("Reply received");
   } catch (error) {
     if (error.name === "AbortError") {
       if (currentReplyNode) {
         currentReplyNode.textContent = "Conversation canceled.";
       }
-      setStatus("Conversation canceled");
       await refreshConversations({ selectIfMissing: false }).catch(() => {});
     } else {
       if (currentReplyNode) {
@@ -274,7 +267,6 @@ async function submitMessage(message) {
       } else {
         renderMessage("assistant", `Error: ${error.message}`, true);
       }
-      setStatus("Error");
     }
   } finally {
     currentAbortController = null;
@@ -300,7 +292,6 @@ async function cancelConversation() {
   }).catch(() => {});
 
   await refreshConversations({ selectIfMissing: false }).catch(() => {});
-  setStatus("Conversation canceled");
 }
 
 async function clearThread() {
@@ -313,7 +304,6 @@ async function clearThread() {
   activeConversationSubtitleEl.textContent = "Select a thread or start a new one.";
   activeConversationId = "";
   localStorage.removeItem(STORAGE_KEY);
-  setStatus("Thread cleared");
   await createConversation().catch(() => {});
 }
 
@@ -367,7 +357,6 @@ async function initialize() {
   } catch (error) {
     messagesEl.innerHTML = "";
     renderMessage("assistant", `Error loading conversations: ${error.message}`, true);
-    setStatus("Failed to load conversations");
   }
 }
 
@@ -375,5 +364,4 @@ autosize();
 initialize().catch((error) => {
   messagesEl.innerHTML = "";
   renderMessage("assistant", `Initialization error: ${error.message}`, true);
-  setStatus("Initialization failed");
 });

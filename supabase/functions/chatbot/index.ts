@@ -19,12 +19,15 @@ type SupportedContextItem = {
 };
 
 async function callModel(messages: ChatMessage[]) {
-  const apiKey = Deno.env.get("MODEL_API_KEY") || Deno.env.get("OPENAI_API_KEY") || "";
-  const modelName = Deno.env.get("MODEL_NAME") || "gpt-4.1-mini";
-  const baseUrl = (Deno.env.get("MODEL_BASE_URL") || "https://api.openai.com/v1").replace(/\/+$/, "");
+  const apiKey = Deno.env.get("GEMINI_API_KEY") || "";
+  const modelName = Deno.env.get("GEMINI_MODEL") || "gemini-2.5-flash";
+  const baseUrl = (Deno.env.get("GEMINI_BASE_URL") || "https://generativelanguage.googleapis.com/v1beta/openai/").replace(
+    /\/+$/,
+    ""
+  );
 
   if (!apiKey) {
-    throw new Error("Missing MODEL_API_KEY.");
+    throw new Error("Missing GEMINI_API_KEY.");
   }
 
   const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -103,7 +106,7 @@ Deno.serve(async (req) => {
       {
         role: "system",
         content:
-          "You are a concise, helpful chatbot. Keep replies short, natural, and conversational.",
+          "You are a concise, helpful Gemini-powered chatbot. Keep replies short, natural, and conversational.",
       },
       ...(
         Array.isArray(context)

@@ -4,13 +4,47 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 const { randomUUID } = require("node:crypto");
 
+function loadEnvFile() {
+  const envPath = path.join(__dirname, ".env");
+  if (!fs.existsSync(envPath)) {
+    return;
+  }
+
+  const content = fs.readFileSync(envPath, "utf8");
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    const equalsIndex = trimmed.indexOf("=");
+    if (equalsIndex === -1) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, equalsIndex).trim();
+    let value = trimmed.slice(equalsIndex + 1).trim();
+    if (!key || process.env[key] !== undefined) {
+      continue;
+    }
+
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    process.env[key] = value;
+  }
+}
+
+loadEnvFile();
+
 const PORT = Number(process.env.PORT || 3000);
-const MODEL_PROVIDER = process.env.MODEL_PROVIDER || "openai-compatible";
-const MODEL_API_KEY = process.env.MODEL_API_KEY || process.env.OPENAI_API_KEY || "";
-const MODEL_NAME = process.env.MODEL_NAME || process.env.OPENAI_MODEL || "gpt-4.1-mini";
-const MODEL_BASE_URL = (process.env.MODEL_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
 const SUPABASE_EDGE_FUNCTION_URL = SUPABASE_URL ? `${SUPABASE_URL}/functions/v1/chatbot` : "";
+const DEFAULT_MODEL_NAME = "gemini-2.5-flash";
 const MAX_CONTEXT_MESSAGES = 10;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MAX_CONVERSATION_TITLE_CHARS = 48;
@@ -142,7 +176,7 @@ function emitEvent(type, payload = {}) {
 function createConversationTitle(firstUserMessage) {
   const cleaned = sanitizeText(firstUserMessage).replace(/\n+/g, " ");
   if (!cleaned) {
-    return "New conversation";
+    return "New chat";
   }
 
   if (cleaned.length <= MAX_CONVERSATION_TITLE_CHARS) {
@@ -201,7 +235,12 @@ function getConversation(conversationId) {
 }
 
 function upsertConversationRecord(conversation) {
-  const record = serializeConversation(conversation);
+  const record = {
+    ...serializeConversation(conversation),
+    provider: conversation.provider || "gemini-edge",
+    model: conversation.model || DEFAULT_MODEL_NAME,
+    lastError: conversation.lastError || "",
+  };
   const index = dbState.conversations.findIndex((item) => item.id === record.id);
   if (index >= 0) {
     dbState.conversations[index] = record;
@@ -210,12 +249,28 @@ function upsertConversationRecord(conversation) {
   }
 }
 
-function appendMessageRecord(conversationId, role, content) {
+function getNextMessageSequence(conversationId) {
+  const highestSequence = dbState.messages.reduce((max, message) => {
+    if (message.conversationId !== conversationId) {
+      return max;
+    }
+
+    const sequence = Number(message.sequence || 0);
+    return Number.isFinite(sequence) && sequence > max ? sequence : max;
+  }, 0);
+
+  return highestSequence + 1;
+}
+
+function appendMessageRecord(conversationId, role, content, tokenCount = null) {
   const record = {
     id: randomUUID(),
     conversationId,
     role,
     content,
+    contentPreview: previewText(content),
+    sequence: getNextMessageSequence(conversationId),
+    tokenCount,
     createdAt: new Date().toISOString(),
   };
   dbState.messages.push(record);
@@ -223,11 +278,19 @@ function appendMessageRecord(conversationId, role, content) {
 }
 
 function upsertInferenceLog(logRecord) {
+  const normalizedRecord = {
+    ...logRecord,
+    tokenUsage: logRecord.tokenUsage || {
+      prompt_tokens: logRecord.promptTokens ?? null,
+      completion_tokens: logRecord.completionTokens ?? null,
+      total_tokens: logRecord.totalTokens ?? null,
+    },
+  };
   const index = dbState.inferenceLogs.findIndex((item) => item.id === logRecord.id);
   if (index >= 0) {
-    dbState.inferenceLogs[index] = logRecord;
+    dbState.inferenceLogs[index] = normalizedRecord;
   } else {
-    dbState.inferenceLogs.push(logRecord);
+    dbState.inferenceLogs.push(normalizedRecord);
   }
 }
 
@@ -254,6 +317,10 @@ function reconstructConversations() {
     const list = messagesByConversationId.get(message.conversationId) || [];
     list.push(message);
     messagesByConversationId.set(message.conversationId, list);
+  }
+
+  for (const list of messagesByConversationId.values()) {
+    list.sort((left, right) => Number(left.sequence || 0) - Number(right.sequence || 0));
   }
 
   for (const record of dbState.conversations) {
@@ -318,8 +385,8 @@ function previewText(text, maxLen = 180) {
 
 async function ingestInferenceLog(payload) {
   const conversationId = String(payload.conversationId || payload.sessionId || "").trim();
-  const provider = sanitizeText(payload.provider) || MODEL_PROVIDER;
-  const model = sanitizeText(payload.model) || MODEL_NAME;
+  const provider = sanitizeText(payload.provider) || "gemini-edge";
+  const model = sanitizeText(payload.model) || DEFAULT_MODEL_NAME;
   const status = sanitizeText(payload.status) || "success";
   const latencyMs = Number(payload.latencyMs || 0);
   const startedAt = payload.startedAt || new Date().toISOString();
@@ -464,64 +531,9 @@ function aggregateDashboardMetrics() {
   };
 }
 
-async function callOpenAiCompatibleModel(messages, signal) {
-  if (!MODEL_API_KEY) {
-    throw new Error("Set MODEL_API_KEY (or OPENAI_API_KEY) to enable model responses.");
-  }
-
-  const startedAt = Date.now();
-  const response = await fetch(`${MODEL_BASE_URL}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${MODEL_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: MODEL_NAME,
-      messages,
-      temperature: 0.7,
-    }),
-    signal,
-  });
-
-  const rawText = await response.text();
-  let data = null;
-  if (rawText) {
-    try {
-      data = JSON.parse(rawText);
-    } catch {
-      data = { raw: rawText };
-    }
-  }
-
-  const latencyMs = Date.now() - startedAt;
-
-  if (!response.ok) {
-    const detail = data?.error?.message || data?.raw || `HTTP ${response.status}`;
-    const error = new Error(`OpenAI request failed: ${detail}`);
-    error.statusCode = response.status;
-    error.latencyMs = latencyMs;
-    throw error;
-  }
-
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) {
-    const error = new Error("The model returned an empty response.");
-    error.statusCode = 502;
-    error.latencyMs = latencyMs;
-    throw error;
-  }
-
-  return {
-    reply: String(content).trim(),
-    usage: data?.usage || null,
-    latencyMs,
-  };
-}
-
 async function callSupabaseEdgeFunction(messages, signal) {
   if (!SUPABASE_EDGE_FUNCTION_URL) {
-    throw new Error("Set SUPABASE_URL to enable the Supabase Edge Function path.");
+    throw createHttpError("Set SUPABASE_URL to enable the Supabase Edge Function path.", 500);
   }
 
   const userMessage = messages[messages.length - 1]?.content || "";
@@ -577,27 +589,16 @@ async function callSupabaseEdgeFunction(messages, signal) {
   return {
     reply: String(reply).trim(),
     usage: data?.usage || null,
+    model: sanitizeText(data?.model) || DEFAULT_MODEL_NAME,
     latencyMs,
   };
 }
 
 async function callModel(messages, signal) {
-  if (SUPABASE_EDGE_FUNCTION_URL) {
-    try {
-      const edgeResult = await callSupabaseEdgeFunction(messages, signal);
-      return {
-        ...edgeResult,
-        provider: "supabase-edge",
-      };
-    } catch (edgeError) {
-      console.error("Supabase edge function call failed, falling back to direct model call", edgeError);
-    }
-  }
-
-  const fallbackResult = await callOpenAiCompatibleModel(messages, signal);
+  const edgeResult = await callSupabaseEdgeFunction(messages, signal);
   return {
-    ...fallbackResult,
-    provider: MODEL_PROVIDER,
+    ...edgeResult,
+    provider: "gemini-edge",
   };
 }
 
@@ -637,11 +638,13 @@ async function handleListConversations(req, res) {
 
 async function handleCreateConversation(req, res) {
   const payload = await readJson(req);
-  const title = sanitizeText(payload.title) || "New conversation";
+  const title = sanitizeText(payload.title) || "New chat";
   const conversation = {
     id: randomUUID(),
     title,
     status: "idle",
+    provider: "gemini-edge",
+    model: DEFAULT_MODEL_NAME,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     preview: "",
@@ -698,8 +701,10 @@ async function handleSendMessage(conversationId, req, res) {
   const conversation = conversations.get(conversationId) || null;
   const targetConversation = conversation || {
     id: conversationId,
-    title: "New conversation",
+    title: "New chat",
     status: "idle",
+    provider: "gemini-edge",
+    model: DEFAULT_MODEL_NAME,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     preview: "",
@@ -711,6 +716,7 @@ async function handleSendMessage(conversationId, req, res) {
   if (!conversations.has(conversationId)) {
     conversations.set(conversationId, targetConversation);
     upsertConversationRecord(targetConversation);
+    await schedulePersist();
   }
 
   const payload = await readJson(req);
@@ -727,14 +733,16 @@ async function handleSendMessage(conversationId, req, res) {
     createdAt: new Date().toISOString(),
   };
 
-  targetConversation.messages.push(userMessage);
   appendMessageRecord(targetConversation.id, "user", userMessage.content);
-  if (!targetConversation.title || targetConversation.title === "New conversation") {
+  targetConversation.messages.push(userMessage);
+  if (!targetConversation.title || targetConversation.title === "New chat") {
     targetConversation.title = createConversationTitle(message);
   }
   targetConversation.preview = inputPreview;
   targetConversation.status = "thinking";
   targetConversation.lastError = "";
+  targetConversation.provider = "gemini-edge";
+  targetConversation.model = DEFAULT_MODEL_NAME;
   touchConversation(targetConversation);
   upsertConversationRecord(targetConversation);
   emitEvent("message.received", {
@@ -752,7 +760,8 @@ async function handleSendMessage(conversationId, req, res) {
   const requestId = randomUUID();
   targetConversation.activeRequestId = requestId;
   inFlightRequests.set(targetConversation.id, { controller, requestId });
-  let inferenceProvider = SUPABASE_EDGE_FUNCTION_URL ? "supabase-edge" : MODEL_PROVIDER;
+  const inferenceProvider = "gemini-edge";
+  let modelName = DEFAULT_MODEL_NAME;
 
   const abortOnClose = () => controller.abort();
   req.on("close", abortOnClose);
@@ -760,15 +769,16 @@ async function handleSendMessage(conversationId, req, res) {
   const startedAt = new Date().toISOString();
   try {
     const modelResult = await callModel(modelMessages, controller.signal);
-    inferenceProvider = modelResult.provider || inferenceProvider;
     const reply = redactPii(modelResult.reply);
+    modelName = modelResult.model || DEFAULT_MODEL_NAME;
+    targetConversation.model = modelName;
 
+    appendMessageRecord(targetConversation.id, "assistant", reply);
     targetConversation.messages.push({
       role: "assistant",
       content: reply,
       createdAt: new Date().toISOString(),
     });
-    appendMessageRecord(targetConversation.id, "assistant", reply);
     targetConversation.preview = previewText(reply);
     targetConversation.status = "idle";
     touchConversation(targetConversation);
@@ -781,7 +791,7 @@ async function handleSendMessage(conversationId, req, res) {
     const inferenceLog = await safeIngestInferenceLog({
       conversationId: targetConversation.id,
       provider: inferenceProvider,
-      model: MODEL_NAME,
+      model: modelName,
       status: "success",
       latencyMs: modelResult.latencyMs,
       startedAt,
@@ -811,7 +821,7 @@ async function handleSendMessage(conversationId, req, res) {
       await safeIngestInferenceLog({
         conversationId: targetConversation.id,
         provider: inferenceProvider,
-        model: MODEL_NAME,
+        model: modelName,
         status: "canceled",
         latencyMs,
         startedAt,
@@ -821,14 +831,14 @@ async function handleSendMessage(conversationId, req, res) {
         errorMessage: "Request canceled.",
       });
       await schedulePersist();
-    return sendJson(res, 499, {
-      error: "Conversation canceled.",
-      conversation: serializeConversation(targetConversation, true),
-    });
-  }
+      return sendJson(res, 499, {
+        error: "Conversation canceled.",
+        conversation: serializeConversation(targetConversation, true),
+      });
+    }
 
-  targetConversation.status = "error";
-  targetConversation.lastError = error instanceof Error ? error.message : "Unexpected error";
+    targetConversation.status = "error";
+    targetConversation.lastError = error instanceof Error ? error.message : "Unexpected error";
     touchConversation(targetConversation);
     upsertConversationRecord(targetConversation);
     emitEvent("conversation.failed", {
@@ -842,7 +852,7 @@ async function handleSendMessage(conversationId, req, res) {
     await safeIngestInferenceLog({
       conversationId: targetConversation.id,
       provider: inferenceProvider,
-      model: MODEL_NAME,
+      model: modelName,
       status: "error",
       latencyMs,
       startedAt,
@@ -972,9 +982,14 @@ const server = http.createServer((req, res) => {
 });
 
 async function bootstrap() {
+  if (!SUPABASE_URL) {
+    throw new Error("Set SUPABASE_URL to use the Supabase Edge Function path.");
+  }
+
   await loadDatastore();
   server.listen(PORT, () => {
-    console.log(`Chatbot app running at http://localhost:${PORT}`);
+    console.log(`ChatBot running at http://localhost:${PORT}`);
+    console.log(`Using Supabase Edge Function: ${SUPABASE_EDGE_FUNCTION_URL}`);
   });
 
   setInterval(() => {
