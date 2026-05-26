@@ -1,7 +1,0 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: chatbot-config
-data:
-  gemini_base_url: https://generativelanguage.googleapis.com/v1beta/openai/
-  gemini_model: gemini-2.5-flash

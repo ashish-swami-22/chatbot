@@ -1,15 +1,24 @@
-FROM node:20-alpine
-
+FROM node:20-alpine AS deps
 WORKDIR /app
 
-COPY package.json ./
-COPY server.js ./
-COPY public ./public
+COPY package.json package-lock.json ./
+RUN npm ci
 
-RUN mkdir -p /app/data
+COPY prisma ./prisma
+RUN npx prisma generate
 
+FROM node:20-alpine AS runtime
+WORKDIR /app
+
+ENV NODE_ENV=production
 ENV PORT=3000
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+COPY prisma ./prisma
+COPY public ./public
+COPY server.js ./
 
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+CMD ["sh", "-c", "npx prisma migrate deploy && node server.js"]

@@ -22,16 +22,12 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 
-# local app data
-data/
-
 # editor settings
 .vscode/
 .idea/
 
-# Supabase local temp files
-supabase/.temp/
-supabase/.branches/
+# Kubernetes secret example
+k8s/app-secret.yaml
 
 # local databases
 *.db

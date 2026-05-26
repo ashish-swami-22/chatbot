@@ -1,0 +1,89 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Conversation {
+  id              String           @id @default(uuid())
+  userId          String?          @map("user_id")
+  title           String
+  status          String           @default("idle")
+  provider        String           @default("gemini")
+  model           String           @default("gemini-2.5-flash")
+  preview         String           @default("")
+  lastError       String?          @map("last_error")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+  canceledAt      DateTime?        @map("canceled_at")
+  closedAt        DateTime?        @map("closed_at")
+  messages        Message[]
+  inferenceLogs   InferenceLog[]
+  ingestionEvents IngestionEvent[]
+
+  @@index([userId], map: "conversations_user_id_idx")
+  @@index([status, updatedAt(sort: Desc)], map: "conversations_status_updated_at_idx")
+  @@map("conversations")
+}
+
+model Message {
+  id             String       @id @default(uuid())
+  conversationId String       @map("conversation_id")
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String
+  content        String
+  contentPreview String       @default("") @map("content_preview")
+  sequence       Int
+  tokenCount     Int?         @map("token_count")
+  createdAt      DateTime     @default(now()) @map("created_at")
+
+  @@unique([conversationId, sequence], map: "messages_conversation_sequence_idx")
+  @@index([conversationId, createdAt(sort: Desc)], map: "messages_conversation_id_created_at_idx")
+  @@map("messages")
+}
+
+model InferenceLog {
+  id               String           @id @default(uuid())
+  conversationId   String           @map("conversation_id")
+  conversation     Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  userId           String?          @map("user_id")
+  provider         String
+  model            String
+  status           String
+  latencyMs        Int              @map("latency_ms")
+  promptTokens     Int?             @map("prompt_tokens")
+  completionTokens Int?             @map("completion_tokens")
+  totalTokens      Int?             @map("total_tokens")
+  startedAt        DateTime         @map("started_at")
+  completedAt      DateTime         @map("completed_at")
+  loggedAt         DateTime         @default(now()) @map("logged_at")
+  inputPreview     String           @default("") @map("input_preview")
+  outputPreview    String           @default("") @map("output_preview")
+  errorMessage     String?          @map("error_message")
+  requestId        String?          @map("request_id")
+  metadata         Json
+  ingestionEvents  IngestionEvent[]
+
+  @@index([conversationId, loggedAt(sort: Desc)], map: "inference_logs_conversation_id_logged_at_idx")
+  @@index([status, loggedAt(sort: Desc)], map: "inference_logs_status_logged_at_idx")
+  @@index([model, loggedAt(sort: Desc)], map: "inference_logs_model_logged_at_idx")
+  @@map("inference_logs")
+}
+
+model IngestionEvent {
+  id             String        @id @default(uuid())
+  eventType      String        @map("event_type")
+  conversationId String?       @map("conversation_id")
+  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  inferenceLogId String?       @map("inference_log_id")
+  inferenceLog   InferenceLog? @relation(fields: [inferenceLogId], references: [id], onDelete: Cascade)
+  payload        Json
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  @@index([eventType, createdAt(sort: Desc)], map: "ingestion_events_event_type_created_at_idx")
+  @@index([conversationId, createdAt(sort: Desc)], map: "ingestion_events_conversation_id_created_at_idx")
+  @@map("ingestion_events")
+}

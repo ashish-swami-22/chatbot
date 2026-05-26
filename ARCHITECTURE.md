@@ -1,38 +1,55 @@
 # Architecture Notes
 
+## Runtime Flow
+
+1. The browser submits a message to the Node server.
+2. The server stores conversations and messages in PostgreSQL through Prisma.
+3. The server sends the user prompt and recent context to Gemini.
+4. The reply, token usage, metadata, and timing information are stored in PostgreSQL.
+5. The dashboard reads aggregated metrics from the same database.
+
 ## Ingestion Flow
 
-1. The UI submits a user message to the chat API.
-2. The server stores the user message and builds a short context window.
-3. The model wrapper measures latency and captures token usage, previews, and errors.
-4. The wrapper sends a normalized inference record to the ingestion endpoint.
-5. The ingestion endpoint validates the payload and stores it in the local file-backed datastore.
-6. The dashboard reads aggregated metrics from the stored logs.
+1. The application creates a normalized inference record after each model call.
+2. The record is written to the `inference_logs` table.
+3. A second event record is written to `ingestion_events` for auditability.
+4. The dashboard reads the processed data from PostgreSQL instead of depending on live model traffic.
 
 ## Logging Strategy
 
-- Structured JSON logs are emitted to stdout.
-- Each inference log includes:
-  - model
-  - provider
-  - latency
-  - token usage
-  - timestamps
-  - request status/errors
-  - conversation/session id
-  - input/output previews
-- PII is redacted before storage and logging.
+- Capture model, provider, latency, status, token usage, timestamps, request ID, and previews.
+- Redact obvious PII patterns before storing previews.
+- Keep the raw conversation content in `messages` and use `inputPreview` / `outputPreview` for operational views.
+- Preserve event payloads so ingestion can be inspected after the fact.
+
+## Storage
+
+- PostgreSQL is the source of truth.
+- Prisma models the database and handles migrations.
+- Conversations, messages, inference logs, and ingestion events are stored in separate tables.
+
+## Deployment
+
+- Local infrastructure uses Docker Compose with PostgreSQL.
+- Kubernetes manifests are provided for app deployment.
+- Secrets are injected through environment variables or Kubernetes Secrets.
+
+## Security
+
+- Provider API keys never reach the browser.
+- Database URLs and API keys are server-side only.
+- Example secret files are included only as templates.
 
 ## Scaling Considerations
 
-- The default datastore is a local JSON file.
-- For horizontal scaling, move persistence to PostgreSQL or another external store if needed.
-- Dashboard aggregates are computed on read for simplicity.
-- If volume grows, precompute counters or push logs to a queue.
+- The current server keeps the in-memory conversation cache small and reconstructs it from PostgreSQL on startup.
+- The ingestion path is synchronous enough for a small demo, but a queue would be better if log volume increased.
+- The dashboard polls the API every few seconds, which is practical for local use but not ideal for a high-traffic installation.
+- The app currently runs one Node process, so horizontal scaling would require careful handling of conversation state and cleanup jobs.
 
 ## Failure Handling Assumptions
 
-- Provider failures can happen due to timeouts, rate limits, or invalid responses.
-- Canceling a conversation aborts the in-flight request.
-- Malformed ingestion payloads are rejected.
-- If persistence fails, the app logs the error and keeps serving chat requests when possible.
+- If the model call fails, the conversation is marked as errored and the failure is logged.
+- If the request is canceled, the conversation is marked as canceled and the result is stored as a canceled inference record.
+- If the database write fails, the server logs the error and continues serving, but operational data can be lost.
+- If the database is unavailable at startup, the app exits rather than serving in a degraded state.

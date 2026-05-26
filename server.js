@@ -1,8 +1,75 @@
 const http = require("node:http");
 const fs = require("node:fs");
-const fsp = require("node:fs/promises");
 const path = require("node:path");
 const { randomUUID } = require("node:crypto");
+const { PrismaClient } = require("@prisma/client");
+
+function getSelectedProvider() {
+  return (process.env.LLM_PROVIDER || process.env.GEMINI_PROVIDER || "gemini").trim().toLowerCase() || "gemini";
+}
+
+function getProviderDefaultModel(provider) {
+  switch (String(provider || "").trim().toLowerCase()) {
+    case "openai":
+      return "gpt-4.1-mini";
+    case "deepseek":
+      return "deepseek-chat";
+    case "grok":
+      return "grok-2-latest";
+    case "gemini":
+    default:
+      return "gemini-2.5-flash";
+  }
+}
+
+function getProviderDefaultBaseUrl(provider) {
+  switch (String(provider || "").trim().toLowerCase()) {
+    case "openai":
+      return "https://api.openai.com/v1";
+    case "deepseek":
+      return "https://api.deepseek.com/v1";
+    case "grok":
+      return "https://api.x.ai/v1";
+    case "gemini":
+    default:
+      return "https://generativelanguage.googleapis.com/v1beta/openai/";
+  }
+}
+
+function getConfigValue(provider, key, fallback = "") {
+  const upper = String(provider || "").trim().toUpperCase();
+  const candidateKeys = [
+    `${upper}_${key}`,
+    `LLM_${key}`,
+    `GEMINI_${key}`,
+    `OPENAI_${key}`,
+    `DEEPSEEK_${key}`,
+    `GROK_${key}`,
+  ];
+
+  for (const envKey of candidateKeys) {
+    const value = process.env[envKey];
+    if (value !== undefined && String(value).trim() !== "") {
+      return String(value).trim();
+    }
+  }
+
+  return fallback;
+}
+
+function resolveModelConfig() {
+  const provider = getSelectedProvider();
+  const model = getConfigValue(provider, "MODEL", getProviderDefaultModel(provider));
+  const apiKey = getConfigValue(provider, "API_KEY", "");
+  const baseUrl = getConfigValue(provider, "BASE_URL", getProviderDefaultBaseUrl(provider)).replace(/\/+$/, "");
+
+  return {
+    provider,
+    model,
+    apiKey,
+    baseUrl,
+  };
+}
 
 function loadEnvFile() {
   const envPath = path.join(__dirname, ".env");
@@ -41,15 +108,15 @@ function loadEnvFile() {
 
 loadEnvFile();
 
+const MODEL_CONFIG = resolveModelConfig();
 const PORT = Number(process.env.PORT || 3000);
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const DEFAULT_MODEL_NAME = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const GEMINI_BASE_URL = (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta/openai/").replace(/\/+$/, "");
+const DEFAULT_PROVIDER = MODEL_CONFIG.provider;
+const DEFAULT_MODEL_NAME = MODEL_CONFIG.model;
+const DEFAULT_API_KEY = MODEL_CONFIG.apiKey;
+const DEFAULT_BASE_URL = MODEL_CONFIG.baseUrl;
 const MAX_CONTEXT_MESSAGES = 10;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MAX_CONVERSATION_TITLE_CHARS = 48;
-const DATA_DIR = path.join(__dirname, "data");
-const DB_PATH = path.join(DATA_DIR, "db.json");
 
 const conversations = new Map();
 const inFlightRequests = new Map();
@@ -60,7 +127,147 @@ const dbState = {
   events: [],
 };
 
-let persistChain = Promise.resolve();
+const prismaGlobal = globalThis;
+const prisma = prismaGlobal.prisma || new PrismaClient({ log: ["error", "warn"] });
+if (process.env.NODE_ENV !== "production") {
+  prismaGlobal.prisma = prisma;
+}
+
+let dbWriteChain = Promise.resolve();
+let cleanupInterval = null;
+
+function queueDbOperation(operation, label) {
+  dbWriteChain = dbWriteChain
+    .then(operation)
+    .catch((error) => {
+      console.error(`Failed to persist ${label}`, error);
+    });
+  return dbWriteChain;
+}
+
+function queueConversationPersist(record) {
+  return queueDbOperation(async () => {
+    await prisma.conversation.upsert({
+      where: { id: record.id },
+      create: {
+        id: record.id,
+        userId: record.userId || null,
+        title: record.title,
+        status: record.status,
+        provider: record.provider || DEFAULT_PROVIDER,
+        model: record.model || DEFAULT_MODEL_NAME,
+        preview: record.preview || "",
+        lastError: record.lastError || null,
+        createdAt: new Date(record.createdAt),
+        updatedAt: new Date(record.updatedAt),
+        canceledAt: record.canceledAt ? new Date(record.canceledAt) : null,
+        closedAt: record.closedAt ? new Date(record.closedAt) : null,
+      },
+      update: {
+        userId: record.userId || null,
+        title: record.title,
+        status: record.status,
+        provider: record.provider || DEFAULT_PROVIDER,
+        model: record.model || DEFAULT_MODEL_NAME,
+        preview: record.preview || "",
+        lastError: record.lastError || null,
+        updatedAt: new Date(record.updatedAt),
+        canceledAt: record.canceledAt ? new Date(record.canceledAt) : null,
+        closedAt: record.closedAt ? new Date(record.closedAt) : null,
+      },
+    });
+  }, "conversation");
+}
+
+function queueMessagePersist(record) {
+  return queueDbOperation(async () => {
+    await prisma.message.upsert({
+      where: {
+        conversationId_sequence: {
+          conversationId: record.conversationId,
+          sequence: record.sequence,
+        },
+      },
+      create: {
+        id: record.id,
+        conversationId: record.conversationId,
+        role: record.role,
+        content: record.content,
+        contentPreview: record.contentPreview || previewText(record.content),
+        sequence: record.sequence,
+        tokenCount: record.tokenCount ?? null,
+        createdAt: new Date(record.createdAt),
+      },
+      update: {
+        role: record.role,
+        content: record.content,
+        contentPreview: record.contentPreview || previewText(record.content),
+        tokenCount: record.tokenCount ?? null,
+      },
+    });
+  }, "message");
+}
+
+function queueInferenceLogPersist(record) {
+  return queueDbOperation(async () => {
+    await prisma.inferenceLog.upsert({
+      where: { id: record.id },
+      create: {
+        id: record.id,
+        conversationId: record.conversationId,
+        userId: record.userId || null,
+        provider: record.provider,
+        model: record.model,
+        status: record.status,
+        latencyMs: record.latencyMs,
+        promptTokens: record.promptTokens ?? null,
+        completionTokens: record.completionTokens ?? null,
+        totalTokens: record.totalTokens ?? null,
+        startedAt: new Date(record.startedAt),
+        completedAt: new Date(record.completedAt),
+        loggedAt: new Date(record.loggedAt),
+        inputPreview: record.inputPreview || "",
+        outputPreview: record.outputPreview || "",
+        errorMessage: record.errorMessage || null,
+        requestId: record.requestId || null,
+        metadata: record.metadata || {},
+      },
+      update: {
+        userId: record.userId || null,
+        provider: record.provider,
+        model: record.model,
+        status: record.status,
+        latencyMs: record.latencyMs,
+        promptTokens: record.promptTokens ?? null,
+        completionTokens: record.completionTokens ?? null,
+        totalTokens: record.totalTokens ?? null,
+        startedAt: new Date(record.startedAt),
+        completedAt: new Date(record.completedAt),
+        loggedAt: new Date(record.loggedAt),
+        inputPreview: record.inputPreview || "",
+        outputPreview: record.outputPreview || "",
+        errorMessage: record.errorMessage || null,
+        requestId: record.requestId || null,
+        metadata: record.metadata || {},
+      },
+    });
+  }, "inference log");
+}
+
+function queueEventPersist(record) {
+  return queueDbOperation(async () => {
+    await prisma.ingestionEvent.create({
+      data: {
+        id: record.id,
+        eventType: record.type,
+        conversationId: record.payload?.conversationId || null,
+        inferenceLogId: record.payload?.inferenceLogId || null,
+        payload: record.payload || {},
+        createdAt: new Date(record.createdAt),
+      },
+    });
+  }, "event");
+}
 
 function getContentType(filePath) {
   switch (path.extname(filePath).toLowerCase()) {
@@ -170,6 +377,7 @@ function emitEvent(type, payload = {}) {
     createdAt: new Date().toISOString(),
   };
   dbState.events.push(record);
+  queueEventPersist(record);
   return record;
 }
 
@@ -237,7 +445,8 @@ function getConversation(conversationId) {
 function upsertConversationRecord(conversation) {
   const record = {
     ...serializeConversation(conversation),
-    provider: conversation.provider || "gemini",
+    userId: conversation.userId || null,
+    provider: conversation.provider || DEFAULT_PROVIDER,
     model: conversation.model || DEFAULT_MODEL_NAME,
     lastError: conversation.lastError || "",
   };
@@ -247,6 +456,7 @@ function upsertConversationRecord(conversation) {
   } else {
     dbState.conversations.push(record);
   }
+  queueConversationPersist(record);
 }
 
 function getNextMessageSequence(conversationId) {
@@ -274,16 +484,20 @@ function appendMessageRecord(conversationId, role, content, tokenCount = null) {
     createdAt: new Date().toISOString(),
   };
   dbState.messages.push(record);
+  queueMessagePersist(record);
   return record;
 }
 
 function upsertInferenceLog(logRecord) {
+  const tokenUsage = logRecord.tokenUsage || {};
   const normalizedRecord = {
     ...logRecord,
-    tokenUsage: logRecord.tokenUsage || {
-      prompt_tokens: logRecord.promptTokens ?? null,
-      completion_tokens: logRecord.completionTokens ?? null,
-      total_tokens: logRecord.totalTokens ?? null,
+    promptTokens: logRecord.promptTokens ?? tokenUsage.prompt_tokens ?? tokenUsage.promptTokens ?? null,
+    completionTokens:
+      logRecord.completionTokens ?? tokenUsage.completion_tokens ?? tokenUsage.completionTokens ?? null,
+    totalTokens: logRecord.totalTokens ?? tokenUsage.total_tokens ?? tokenUsage.totalTokens ?? null,
+    metadata: logRecord.metadata || {
+      tokenUsage,
     },
   };
   const index = dbState.inferenceLogs.findIndex((item) => item.id === logRecord.id);
@@ -292,21 +506,11 @@ function upsertInferenceLog(logRecord) {
   } else {
     dbState.inferenceLogs.push(normalizedRecord);
   }
+  queueInferenceLogPersist(normalizedRecord);
 }
 
 function schedulePersist() {
-  persistChain = persistChain
-    .then(async () => {
-      await fsp.mkdir(DATA_DIR, { recursive: true });
-      const snapshot = JSON.stringify(dbState, null, 2);
-      const tempPath = `${DB_PATH}.tmp`;
-      await fsp.writeFile(tempPath, snapshot, "utf8");
-      await fsp.rename(tempPath, DB_PATH);
-    })
-    .catch((error) => {
-      console.error("Failed to persist datastore", error);
-    });
-  return persistChain;
+  return dbWriteChain;
 }
 
 function reconstructConversations() {
@@ -334,18 +538,71 @@ function reconstructConversations() {
 }
 
 async function loadDatastore() {
-  try {
-    const raw = await fsp.readFile(DB_PATH, "utf8");
-    const parsed = JSON.parse(raw);
-    dbState.conversations = Array.isArray(parsed.conversations) ? parsed.conversations : [];
-    dbState.messages = Array.isArray(parsed.messages) ? parsed.messages : [];
-    dbState.inferenceLogs = Array.isArray(parsed.inferenceLogs) ? parsed.inferenceLogs : [];
-    dbState.events = Array.isArray(parsed.events) ? parsed.events : [];
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      console.error("Failed to load datastore", error);
-    }
-  }
+  const [conversationRows, messageRows, inferenceLogRows, eventRows] = await Promise.all([
+    prisma.conversation.findMany({ orderBy: { updatedAt: "desc" } }),
+    prisma.message.findMany({ orderBy: [{ conversationId: "asc" }, { sequence: "asc" }] }),
+    prisma.inferenceLog.findMany({ orderBy: { loggedAt: "asc" } }),
+    prisma.ingestionEvent.findMany({ orderBy: { createdAt: "asc" } }),
+  ]);
+
+  dbState.conversations = conversationRows.map((row) => ({
+    id: row.id,
+    userId: row.userId || null,
+    title: row.title,
+    status: row.status,
+    provider: row.provider || DEFAULT_PROVIDER,
+    model: row.model || DEFAULT_MODEL_NAME,
+    preview: row.preview || "",
+    lastError: row.lastError || "",
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+    canceledAt: row.canceledAt ? row.canceledAt.toISOString() : null,
+    closedAt: row.closedAt ? row.closedAt.toISOString() : null,
+  }));
+
+  dbState.messages = messageRows.map((row) => ({
+    id: row.id,
+    conversationId: row.conversationId,
+    role: row.role,
+    content: row.content,
+    contentPreview: row.contentPreview || previewText(row.content),
+    sequence: row.sequence,
+    tokenCount: row.tokenCount ?? null,
+    createdAt: row.createdAt.toISOString(),
+  }));
+
+  dbState.inferenceLogs = inferenceLogRows.map((row) => ({
+    id: row.id,
+    conversationId: row.conversationId,
+    userId: row.userId || null,
+    provider: row.provider,
+    model: row.model,
+    status: row.status,
+    latencyMs: Number(row.latencyMs || 0),
+    promptTokens: row.promptTokens ?? null,
+    completionTokens: row.completionTokens ?? null,
+    totalTokens: row.totalTokens ?? null,
+    startedAt: row.startedAt.toISOString(),
+    completedAt: row.completedAt.toISOString(),
+    loggedAt: row.loggedAt.toISOString(),
+    inputPreview: row.inputPreview || "",
+    outputPreview: row.outputPreview || "",
+    errorMessage: row.errorMessage || null,
+    requestId: row.requestId || null,
+    metadata: row.metadata || {},
+    tokenUsage: {
+      prompt_tokens: row.promptTokens ?? null,
+      completion_tokens: row.completionTokens ?? null,
+      total_tokens: row.totalTokens ?? null,
+    },
+  }));
+
+  dbState.events = eventRows.map((row) => ({
+    id: row.id,
+    type: row.eventType,
+    payload: row.payload || {},
+    createdAt: row.createdAt.toISOString(),
+  }));
 
   reconstructConversations();
 }
@@ -385,7 +642,7 @@ function previewText(text, maxLen = 180) {
 
 async function ingestInferenceLog(payload) {
   const conversationId = String(payload.conversationId || payload.sessionId || "").trim();
-  const provider = sanitizeText(payload.provider) || "gemini";
+  const provider = sanitizeText(payload.provider) || DEFAULT_PROVIDER;
   const model = sanitizeText(payload.model) || DEFAULT_MODEL_NAME;
   const status = sanitizeText(payload.status) || "success";
   const latencyMs = Number(payload.latencyMs || 0);
@@ -418,6 +675,7 @@ async function ingestInferenceLog(payload) {
     outputPreview,
     errorMessage: errorMessage || null,
     tokenUsage,
+    metadata: payload.metadata && typeof payload.metadata === "object" ? payload.metadata : {},
   };
 
   upsertInferenceLog(record);
@@ -442,35 +700,12 @@ async function ingestInferenceLog(payload) {
   return record;
 }
 
-async function forwardInferenceLogToEndpoint(payload) {
-  const response = await fetch(`http://127.0.0.1:${PORT}/api/ingest`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const detail = data.error || `HTTP ${response.status}`;
-    throw createHttpError(`Ingestion endpoint failed: ${detail}`, response.status);
-  }
-
-  return data.record || null;
-}
-
 async function safeIngestInferenceLog(payload) {
   try {
-    return await forwardInferenceLogToEndpoint(payload);
+    return await ingestInferenceLog(payload);
   } catch (error) {
-    console.error("Failed to ingest inference log via endpoint", error);
-    try {
-      return await ingestInferenceLog(payload);
-    } catch (fallbackError) {
-      console.error("Fallback ingestion failed", fallbackError);
-      return null;
-    }
+    console.error("Failed to ingest inference log", error);
+    return null;
   }
 }
 
@@ -532,15 +767,15 @@ function aggregateDashboardMetrics() {
 }
 
 async function callModel(messages, signal) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("Set GEMINI_API_KEY to enable model responses.");
+  if (!DEFAULT_API_KEY) {
+    throw new Error(`Set ${DEFAULT_PROVIDER.toUpperCase()}_API_KEY or LLM_API_KEY to enable model responses.`);
   }
 
   const startedAt = Date.now();
-  const response = await fetch(`${GEMINI_BASE_URL}/chat/completions`, {
+  const response = await fetch(`${DEFAULT_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${GEMINI_API_KEY}`,
+      Authorization: `Bearer ${DEFAULT_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -596,7 +831,9 @@ function cleanupExpiredConversations() {
       dbState.messages = dbState.messages.filter((item) => item.conversationId !== conversationId);
       dbState.inferenceLogs = dbState.inferenceLogs.filter((item) => item.conversationId !== conversationId);
       dbState.events = dbState.events.filter((item) => item.payload?.conversationId !== conversationId);
-      void schedulePersist();
+      queueDbOperation(async () => {
+        await prisma.conversation.deleteMany({ where: { id: conversationId } });
+      }, "expired conversation delete");
     }
   }
 }
@@ -627,8 +864,9 @@ async function handleCreateConversation(req, res) {
   const conversation = {
     id: randomUUID(),
     title,
+    userId: null,
     status: "idle",
-    provider: "gemini",
+    provider: DEFAULT_PROVIDER,
     model: DEFAULT_MODEL_NAME,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -687,8 +925,9 @@ async function handleSendMessage(conversationId, req, res) {
   const targetConversation = conversation || {
     id: conversationId,
     title: "New chat",
+    userId: null,
     status: "idle",
-    provider: "gemini",
+    provider: DEFAULT_PROVIDER,
     model: DEFAULT_MODEL_NAME,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -726,7 +965,7 @@ async function handleSendMessage(conversationId, req, res) {
   targetConversation.preview = inputPreview;
   targetConversation.status = "thinking";
   targetConversation.lastError = "";
-  targetConversation.provider = "gemini";
+  targetConversation.provider = DEFAULT_PROVIDER;
   targetConversation.model = DEFAULT_MODEL_NAME;
   touchConversation(targetConversation);
   upsertConversationRecord(targetConversation);
@@ -745,7 +984,7 @@ async function handleSendMessage(conversationId, req, res) {
   const requestId = randomUUID();
   targetConversation.activeRequestId = requestId;
   inFlightRequests.set(targetConversation.id, { controller, requestId });
-  const inferenceProvider = "gemini";
+  const inferenceProvider = DEFAULT_PROVIDER;
   let modelName = DEFAULT_MODEL_NAME;
 
   const abortOnClose = () => controller.abort();
@@ -967,15 +1206,46 @@ const server = http.createServer((req, res) => {
 });
 
 async function bootstrap() {
+  if (!process.env.DATABASE_URL) {
+    throw new Error("Set DATABASE_URL to use PostgreSQL.");
+  }
+
+  if (!DEFAULT_API_KEY) {
+    throw new Error(`Set ${DEFAULT_PROVIDER.toUpperCase()}_API_KEY or LLM_API_KEY to enable model responses.`);
+  }
+
   await loadDatastore();
   server.listen(PORT, () => {
     console.log(`ChatBot running at http://localhost:${PORT}`);
   });
 
-  setInterval(() => {
+  cleanupInterval = setInterval(() => {
     cleanupExpiredConversations();
   }, 10 * 60 * 1000);
 }
+
+async function shutdown(signal) {
+  console.log(`Received ${signal}, shutting down gracefully...`);
+  if (cleanupInterval) {
+    clearInterval(cleanupInterval);
+    cleanupInterval = null;
+  }
+  await new Promise((resolve) => server.close(resolve));
+  await dbWriteChain;
+  await prisma.$disconnect();
+}
+
+process.on("SIGINT", () => {
+  shutdown("SIGINT")
+    .catch((error) => console.error("Graceful shutdown failed", error))
+    .finally(() => process.exit(0));
+});
+
+process.on("SIGTERM", () => {
+  shutdown("SIGTERM")
+    .catch((error) => console.error("Graceful shutdown failed", error))
+    .finally(() => process.exit(0));
+});
 
 bootstrap().catch((error) => {
   console.error("Failed to start server", error);

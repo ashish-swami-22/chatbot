@@ -1,0 +1,14 @@
+node_modules
+.next
+.env
+.env.*
+!.env.example
+.git
+coverage
+dist
+out
+logs
+data
+*.db
+*.sqlite
+k8s/app-secret.yaml

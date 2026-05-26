@@ -15,26 +15,28 @@ spec:
       containers:
         - name: chatbot-app
           image: chatbot-app:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3000
           env:
             - name: PORT
               value: "3000"
-            - name: GEMINI_BASE_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: chatbot-config
-                  key: gemini_base_url
-            - name: GEMINI_MODEL
-              valueFrom:
-                configMapKeyRef:
-                  name: chatbot-config
-                  key: gemini_model
-            - name: GEMINI_API_KEY
+            - name: LLM_PROVIDER
+              value: gemini
+            - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: chatbot-secrets
-                  key: gemini_api_key
+                  name: chatbot-app-secret
+                  key: database_url
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: chatbot-app-secret
+                  key: llm_api_key
+            - name: LLM_MODEL
+              value: gemini-2.5-flash
+            - name: LLM_BASE_URL
+              value: https://generativelanguage.googleapis.com/v1beta/openai/
           readinessProbe:
             httpGet:
               path: /health
