@@ -158,8 +158,3 @@ Why this shape:
 - Add time-series charts for throughput, latency percentiles, and error rate.
 - Add a proper ingress and external secret management for Kubernetes.
 - Split migration execution into a separate init job or release step.
-
-## Demo
-
-- Hosted link / Loom: not included in this repo.
-- Screenshots: not included in this repo.
