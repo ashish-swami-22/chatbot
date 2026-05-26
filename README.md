@@ -1,11 +1,11 @@
-# Gemini Chatbot
+# LLM Chatbot
 
 A compact LLM inference logging and chat application built for local Docker development and Kubernetes deployment.
 
 ## Features
 
 - Chat UI with conversation history
-- Server-side Gemini calls
+- Server-side model calls
 - PostgreSQL persistence through Prisma
 - Inference logging and dashboard metrics
 - Docker Compose and Kubernetes deployment paths
@@ -98,7 +98,7 @@ Provided examples:
 Notes:
 
 - `k8s/postgres.yaml` deploys a self-hosted PostgreSQL instance for the app.
-- Store `DATABASE_URL` and `GEMINI_API_KEY` in a Kubernetes Secret.
+- Store `DATABASE_URL` and `LLM_API_KEY` in a Kubernetes Secret.
 - The example service is `ClusterIP`, so use `kubectl port-forward` or add an Ingress for external access.
 - You can use either the included PostgreSQL StatefulSet or a managed PostgreSQL instance.
 

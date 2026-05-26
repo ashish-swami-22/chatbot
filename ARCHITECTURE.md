@@ -4,7 +4,7 @@
 
 1. The browser submits a message to the Node server.
 2. The server stores conversations and messages in PostgreSQL through Prisma.
-3. The server sends the user prompt and recent context to Gemini.
+3. The server sends the user prompt and recent context to the selected model provider.
 4. The reply, token usage, metadata, and timing information are stored in PostgreSQL.
 5. The dashboard reads aggregated metrics from the same database.
 
